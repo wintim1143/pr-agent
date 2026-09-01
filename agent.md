@@ -72,6 +72,20 @@
   4. **验证完立即停掉服务释放端口**（避免下次端口冲突 / 残留进程）。
 - 验证时若 `mastra dev` 在「非真实终端」环境下被回收（Studio 代理起但内层 connection refused），属环境怪象，非代码问题；本机真实终端跑正常。
 
+### 6.1 测试与临时脚本的位置约定（两类，严格分开）
+- **正式测试（会长期存在的）**：必须放在**框架要求的位置**。本仓用 jest，单测放 `test/`（jest 默认收集 `*.test.ts`）。`.tmp/` 里的任何东西都不会被 jest 收集。
+- **一次性验证脚本 / 探针（跑完即弃或留着无妨）**：一律放 `.tmp/verify/`，**自己命名**。这是验证依赖（`@mastra/core` 等）时的落点——`/tmp` 解析不到项目 `node_modules`。
+  - 放 `.tmp/` 里**不需要删除**，gitignore 已忽略，不入库。
+  - `.tmp/` 已在本项目 `.workbuddy/settings.local.json` 的 `sandbox.extraAllowWrite` 写白名单里（权限弹窗免确认），见 §6.2。
+  - `jest.config.js` 的 `testPathIgnorePatterns` / `coveragePathIgnorePatterns` 已排除 `.tmp/`，不会误收集、不会污染覆盖率。
+
+### 6.2 权限弹窗与临时目录白名单
+- **WorkBuddy 支持项目级配置**：项目根 `.workbuddy/settings.local.json`（本地，不进 git）承载本项目专有的 `sandbox.extraAllowWrite`（如 `.tmp/`）。用户级在 `~/.workbuddy/settings.json`。CodeBuddy Code CLI 形态则用 `.codebuddy/settings.json` / `settings.local.json`。
+- 开发机曾遇到 file-safety「会话累计」计数器弹窗（装 skill 一次性写 50 个文件打满阈值后，后续每条涉及文件的命令都被拦）。缓解手段：
+  - **中间产物、探针脚本一律落 `.tmp/verify/`，不落项目根**。
+  - `.tmp/` 已加入本项目 `.workbuddy/settings.local.json → sandbox.extraAllowWrite`，此后在 `.tmp/` 里写文件不再弹窗。
+- 若又遇到无理由授权弹窗，先查 `~/.workbuddy/audit-log/`，别盲目猜是命令本身的问题。
+
 ## 7. 沟通与状态反馈
 - 需求状态变更必须同步到 GitHub issue label（open/approved/in_progress/pr_opened/merged/rejected）+ 飞书卡片。
 - 所有对外动作（创建/合并 PR）都要可追踪、可回滚。

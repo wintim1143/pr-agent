@@ -15,3 +15,18 @@ run/
 .mastra/.build
 .mastra/output
 .mastra/
+
+# Mastra storage(libsql 文件库)。运行时生成,含 workflow 快照,不入库。
+# WAL 模式下会额外产生 -shm / -wal 两个伴生文件。
+mastra.db
+mastra.db-shm
+mastra.db-wal
+
+# 一次性验证脚本(探针 / 手工验证用),不入库,可留着不删。
+# 与 test/ 的区别见 CONTRIBUTING 约定:test/ 进 CI,.tmp/verify/ 不进。
+# 放在项目内而非 /tmp:需要 require/import 项目依赖(node_modules 解析)。
+.tmp/
+
+# WorkBuddy 项目级工作目录:memory(项目记忆)+ settings.local.json(本地权限/沙箱配置)。
+# 均属本地/不共享,不入库。
+.workbuddy/
