@@ -11,3 +11,7 @@ run/
 *.un~
 .tsbuildinfo
 .tsbuildinfo.*
+.env
+.mastra/.build
+.mastra/output
+.mastra/

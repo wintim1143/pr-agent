@@ -1,7 +1,6 @@
 import * as koa from '@midwayjs/koa';
-import { Mastra } from '@mastra/core';
 import { MastraServer } from '@mastra/koa';
-import { devAgent } from './agents/dev-agent';
+import { mastra } from './index';
 
 /**
  * 把 Midway 暴露的 Koa app 交给 @mastra/koa 的 MastraServer 接管，
@@ -15,13 +14,7 @@ import { devAgent } from './agents/dev-agent';
  * 接入入口见 src/configuration.ts 的 onReady()。
  */
 export async function registerMastra(app: koa.Application): Promise<void> {
-  const mastra = new Mastra({
-    agents: {
-      'dev-agent': devAgent,
-    },
-    // TODO: 接入 workflow(编码→测试→审核→commit→PR→合并) 与 skills 目录
-  });
-
+  // mastra 实例来自 ./index.ts(单一真相源,同时供 `mastra dev` 使用)
   const server = new MastraServer({
     app: app as any, // @mastra/koa 期望标准 Koa 实例类型,运行期兼容见上方注释
     mastra,

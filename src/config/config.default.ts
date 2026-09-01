@@ -5,7 +5,7 @@ export default {
   // use for cookie sign key, should change to your own and keep security
   keys: '1788244907769_1633',
   koa: {
-    port: 7001,
+    port: 8001,
   },
   validation: {
     validators: {
