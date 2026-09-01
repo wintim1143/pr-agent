@@ -18,20 +18,57 @@ import type { Mastra } from '@mastra/core';
  *
  * 注意:1.63.2 用 `createStep({...})` 工厂(不是 `new Step(...)`);`Step` 仅为类型。
  */
+/**
+ * 结构化闸门输出契约(文档 P3-1,2026-09-02 定稿)。
+ * - test: 测试闸门,passed 决定是否进入 review
+ * - review: 审核闸门,decision 决定通过(approve)或打回(request-changes)
+ * - commit: commit 闸门,lintPassed 决定是否能进 commit
+ * 三个闸门的输出从 `agent.generate` 的 `structuredOutput` 读取(`result.object`),
+ * 保证 workflow 条件边(branch/dowhile)能依据结构化字段判定,而非解析字符串。
+ */
+const TestGateSchema = z.object({
+  passed: z.boolean(),
+  report: z.string(),
+});
+const ReviewGateSchema = z.object({
+  decision: z.enum(['approve', 'request-changes']),
+  comments: z.array(z.string()),
+});
+const CommitGateSchema = z.object({
+  message: z.string(),
+  lintPassed: z.boolean(),
+});
+
 const ContextSchema = z.object({
   issueNumber: z.number(),
   issueTitle: z.string(),
   issueBody: z.string(),
   branch: z.string().optional(),
   codingResult: z.string().optional(),
-  testResult: z.string().optional(),
-  reviewResult: z.string().optional(),
-  commitMessage: z.string().optional(),
+  testResult: TestGateSchema.optional(),
+  reviewResult: ReviewGateSchema.optional(),
+  commitResult: CommitGateSchema.optional(),
   prNumber: z.number().optional(),
   mergeResult: z.string().optional(),
 });
-/** 用 dev-agent 跑某个质量闸门 skill 的辅助函数 */
-async function runGate(mastra: Mastra, instruction: string): Promise<string> {
+/**
+ * 用 dev-agent 跑质量闸门 skill,输出结构化结果(文档 P3-1)。
+ * 依据 `structuredOutput` 从 `res.object` 读取,保证条件边能按结构化字段判定。
+ */
+async function runGate<S extends z.ZodTypeAny>(
+  mastra: Mastra,
+  instruction: string,
+  schema: S,
+): Promise<z.infer<S>> {
+  const agent = mastra.getAgent('dev-agent');
+  const res = await agent.generate(instruction, {
+    structuredOutput: { schema, errorStrategy: 'strict' },
+  });
+  // structuredOutput 保证 object 符合 schema 形状,此处断言(泛型无法自动推导)
+  return res.object as z.infer<S>;
+}
+/** 用 dev-agent 跑不需要结构化输出的 step(如 coding / merge),返回纯文本。 */
+async function runPlain(mastra: Mastra, instruction: string): Promise<string> {
   const agent = mastra.getAgent('dev-agent');
   const res = await agent.generate(instruction);
   return res.text ?? '';
@@ -57,7 +94,7 @@ const coding = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const text = await runGate(
+    const text = await runPlain(
       mastra,
       `使用 coding skill。需求:${inputData.issueTitle}\n${inputData.issueBody}\n请在当前 feature 分支上产出代码改动。`,
     );
@@ -72,12 +109,13 @@ const testStep = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const text = await runGate(
+    const testResult = await runGate(
       mastra,
-      `使用 code-testing skill 对当前改动运行测试并报告通过/失败。需求:${inputData.issueTitle}`,
+      `使用 code-testing skill 对当前改动运行测试,输出结构化结果 { passed: boolean, report: string }。需求:${inputData.issueTitle}`,
+      TestGateSchema,
     );
-    // TODO: 解析测试结果;失败时回到 coding 重做(条件边 branch/循环)
-    return { ...inputData, testResult: text };
+    // TODO: passed=false 时回到 coding 重做(条件边 branch/dowhile,见文档 §十二)
+    return { ...inputData, testResult };
   },
 });
 
@@ -88,12 +126,13 @@ const review = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const text = await runGate(
+    const reviewResult = await runGate(
       mastra,
-      `使用 code-review skill 审核当前改动。需求:${inputData.issueTitle}`,
+      `使用 code-review skill 审核当前改动,输出结构化结果 { decision: 'approve' | 'request-changes', comments: string[] }。需求:${inputData.issueTitle}`,
+      ReviewGateSchema,
     );
-    // TODO: 解析 approve / request changes;request changes 时回到 coding
-    return { ...inputData, reviewResult: text };
+    // TODO: decision=request-changes 时回到 coding(条件边,见文档 §十二)
+    return { ...inputData, reviewResult };
   },
 });
 
@@ -104,11 +143,12 @@ const commit = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const text = await runGate(
+    const commitResult = await runGate(
       mastra,
-      `使用 commit-message skill 为改动生成 commit message,关联 issue #${inputData.issueNumber}。`,
+      `使用 commit-message skill 为改动生成 commit message,关联 issue #${inputData.issueNumber},输出结构化结果 { message: string, lintPassed: boolean }。`,
+      CommitGateSchema,
     );
-    return { ...inputData, commitMessage: text };
+    return { ...inputData, commitResult };
   },
 });
 
@@ -148,7 +188,7 @@ const merge = createStep({
     if (!resumeData || !(resumeData as { approved?: boolean }).approved) {
       return suspend({ waitingFor: 'merge-approval', issueNumber: inputData.issueNumber });
     }
-    const text = await runGate(
+    const text = await runPlain(
       mastra,
       `使用 merge-pr skill 执行 squash merge 合入 main 并关闭 issue #${inputData.issueNumber}。`,
     );
