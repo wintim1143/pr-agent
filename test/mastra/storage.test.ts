@@ -28,7 +28,7 @@ describe('Mastra storage 持久化', () => {
     tmpDb = join(tmpdir(), `mastra-storage-test-${Date.now()}.db`);
     process.env.MASTRA_DB_PATH = tmpDb;
 
-    const mod = await import('../../src/mastra');
+    const mod = require('../../src/mastra') as typeof import('../../src/mastra');
     mastra = mod.mastra;
   });
 
