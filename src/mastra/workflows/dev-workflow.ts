@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { Workflow, createStep } from '@mastra/core/workflows';
 import type { Mastra } from '@mastra/core';
 import { getFeishuConfig, feishuNotify, buildDevCompleteCard } from '../adapters/feishu';
+import { getGithubConfig, githubCheckout, githubPushAndOpenPR, gitCommit } from '../adapters/github';
 
 /**
  * 自动开发 workflow 骨架(对应文档 §六)。
@@ -11,8 +12,9 @@ import { getFeishuConfig, feishuNotify, buildDevCompleteCard } from '../adapters
  *   每个闸门 step 内部调 dev-agent 并让它加载对应 skill(确定性编排,非自主循环)。
  * - merge 是人工关卡:用 execute 里的 `suspend()` 挂起,等用户在飞书卡片点"合并"后
  *   `resume({ approved: true })` 再真正执行合并。
- * - checkout / push-open-pr 依赖 GitHub client,本项目尚未接入,目前是 TODO 桩(占位值),
- *   不影响流程结构跑通;notify 步已接入飞书 adapter(见 `../adapters/feishu`),
+ * - checkout / push-open-pr 已接入 GitHub adapter(见 `../adapters/github`):
+ *   checkout 用本地 git 建分支,push-open-pr 用 `git push`(token 内嵌 HTTPS)+ `gh pr create` 开 PR。
+ *   未配置 GitHub(`GITHUB_TOKEN` 缺失)时这两步跳过、不阻断流程;notify 步已接入飞书 adapter,
  *   未配置飞书时跳过、推送失败仅告警,不阻断后续合并关卡。
  *
  * 共享上下文 ContextSchema:贯穿全流程,各 step 逐步填充字段。所有 step 的
@@ -72,16 +74,40 @@ async function runPlain(mastra: Mastra, instruction: string): Promise<string> {
   return res.text ?? '';
 }
 
-// 1. checkout:创建 feature 分支(GitHub/本地 git,暂未接入)
+/** 生成 PR 描述(供 push-open-pr 步使用) */
+function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
+  const lines = [
+    `## 自动开发 PR(issue #${ctx.issueNumber})`,
+    '',
+    `**需求**: ${ctx.issueTitle}`,
+    '',
+    ctx.issueBody ? `**描述**:\n${ctx.issueBody}\n` : '',
+    ctx.testResult ? `**测试**: ${ctx.testResult.passed ? '✅ 通过' : '❌ 未通过'} —— ${ctx.testResult.report}` : '',
+    ctx.reviewResult
+      ? `**审核**: ${ctx.reviewResult.decision}${ctx.reviewResult.comments.length ? ` (${ctx.reviewResult.comments.join('; ')})` : ''}`
+      : '',
+    ctx.commitResult ? `**commit**: ${ctx.commitResult.message}` : '',
+    '',
+    '> 由 pr-agent 自动生成,合并前请人工 review。',
+  ];
+  return lines.filter(l => l !== '').join('\n');
+}
+
+// 1. checkout:创建并切到 feature 分支(已接入 GitHub adapter,走本地 git)
 const checkout = createStep({
   id: 'checkout',
   description: '创建并切到 feature 分支 feat/<issue>-<slug>',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
-    // TODO: 接入 git/GitHub client,基于 issueNumber 创建 feat/<n>-<slug> 并 checkout
-    const branch = `feat/${inputData.issueNumber}-dev`;
-    return { ...inputData, branch };
+    try {
+      const branch = await githubCheckout(inputData.issueNumber, inputData.issueTitle);
+      return { ...inputData, branch };
+    } catch (e) {
+      console.warn('[checkout] 创建分支失败:', e instanceof Error ? e.message : e);
+      // 失败不阻断,沿用占位分支名(后续 push-open-pr 会再暴露错误)
+      return { ...inputData, branch: `feat/${inputData.issueNumber}-dev` };
+    }
   },
 });
 
@@ -134,10 +160,10 @@ const review = createStep({
   },
 });
 
-// 5. commit(强制):commit message skill
+// 5. commit(强制):commit message skill + 真实 git commit
 const commit = createStep({
   id: 'commit',
-  description: '调用 commit-message skill 生成 Conventional Commits',
+  description: '调用 commit-message skill 生成 Conventional Commits 并实际提交',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
@@ -146,20 +172,44 @@ const commit = createStep({
       `使用 commit-message skill 为改动生成 commit message,关联 issue #${inputData.issueNumber},输出结构化结果 { message: string, lintPassed: boolean }。`,
       CommitGateSchema
     );
+    // 真正落盘:把当前改动 commit 到 feature 分支(git add -A + commit)
+    try {
+      const r = gitCommit(commitResult.message);
+      if (!r.committed && r.error && r.error !== 'nothing-to-commit') {
+        console.warn('[commit] 未产生提交:', r.error);
+      }
+    } catch (e) {
+      console.warn('[commit] git commit 异常:', e instanceof Error ? e.message : e);
+    }
     return { ...inputData, commitResult };
   },
 });
 
-// 6. push + open PR(GitHub,暂未接入)
+// 6. push + open PR(已接入 GitHub adapter:git push + gh pr create)
 const pushOpenPr = createStep({
   id: 'push-open-pr',
   description: 'push feature 分支并开 PR',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
-    // TODO: 接入 GitHub client:push + 开 PR(标题 `<type>: <subject> (#issue)`)
-    const prNumber = 0; // 占位,接入后替换为真实 PR 号
-    return { ...inputData, prNumber };
+    if (!getGithubConfig()) {
+      // 未配置 GitHub → 跳过,prNumber 保持 0,不阻断后续 notify/merge
+      return { ...inputData, prNumber: 0 };
+    }
+    const res = await githubPushAndOpenPR({
+      branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
+      title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
+      body: buildPrBody(inputData),
+      commitMessage: inputData.commitResult?.message,
+    });
+    if (res.error) {
+      console.warn('[push-open-pr] 开 PR 失败:', res.error);
+    } else if (res.skipped) {
+      console.warn('[push-open-pr] 未配置 GitHub,已跳过');
+    } else if (res.prUrl) {
+      console.log('[push-open-pr] PR 已开:', res.prUrl);
+    }
+    return { ...inputData, prNumber: res.prNumber };
   },
 });
 

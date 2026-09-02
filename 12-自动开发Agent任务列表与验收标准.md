@@ -16,10 +16,10 @@ status: 待确认
 
 | 项目 | 实际状态 |
 |------|---------|
-| 代码 | `main` 上 2 次提交；8 步 workflow 已串通；`checkout` / `push-open-pr`(GitHub)仍是 TODO 桩，`notify`(飞书)已接入 adapter |
+| 代码 | 8 步 workflow 已串通;`checkout`+`commit`+`push-open-pr`(GitHub)已接 adapter(`src/mastra/adapters/github.ts`,真实建分支/提交/推送+开 PR),`notify`(飞书)已接 adapter;闸门输出已结构化(`testResult`/`reviewResult`/`commitResult` 带 schema) |
 | Skills | 6 个 SKILL.md 各约 20 行，只有 prompt 壳；agent 内是 `createSkill` 内联版 |
 | 闸门输出 | **全部是 `string`**（`codingResult` / `testResult` / `reviewResult`），无法做条件判断——这是最大技术债 |
-| 依赖 | **`node_modules` 未安装** |
+| 依赖 | `node_modules` 已安装(`npm install`);流水线 build/test/lint 全绿 |
 | Storage | 无（in-memory，重启丢状态）→ **无法支撑 suspend/resume 等飞书卡片回调** |
 | 测试 | 只有 Midway 自带的 2 个 controller 冒烟，无业务逻辑测试 |
 | 凭据 | `ANTHROPIC_API_KEY` 未设置；`gh` CLI 未安装 |
