@@ -119,6 +119,16 @@ export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
     description: '使用 Claude Code CLI 在目标仓库真正读写文件,完成 issue 对应的编码',
     sdkOptions: {
       cwd: repoRoot,
+      // 注入编码后端端点(lanfengai 中转):编码 CLI 读 ANTHROPIC_* 系列 env。
+      // ⚠️ sdk.d.ts 明确:env 一旦设置会"整个替换"子进程环境、不自动合并 process.env,
+      // 因此必须展开 ...process.env 保留 PATH/HOME 等,否则子进程会因缺基础变量炸掉。
+      // 当前 .env 只有 LLM_*(lanfengai 中转),映射到 ANTHROPIC_* 供 CLI 复用。
+      env: {
+        ...process.env,
+        ANTHROPIC_BASE_URL: process.env.LLM_BASE_URL, // lanfengai.cn/v1(Anthropic Messages 协议挂载点)
+        ANTHROPIC_API_KEY: process.env.LLM_API_KEY,
+        ANTHROPIC_MODEL: process.env.LLM_MODEL || 'glm-5.3',
+      },
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       allowedTools: [
