@@ -111,18 +111,38 @@ const checkout = createStep({
   },
 });
 
-// 2. coding:编码 skill
+// 2. coding:用 ClaudeSDKAgent(Claude Code CLI)真正读写文件(替代 dev-agent 纯文本)
 const coding = createStep({
   id: 'coding',
-  description: '调用编码 skill 产出代码改动',
+  description: '用 ClaudeSDKAgent 在 feature 分支上真正读写文件完成编码',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ mastra, inputData }) => {
-    const text = await runPlain(
-      mastra,
-      `使用 coding skill。需求:${inputData.issueTitle}\n${inputData.issueBody}\n请在当前 feature 分支上产出代码改动。`
-    );
-    return { ...inputData, codingResult: text };
+  execute: async ({ inputData }) => {
+    // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
+    const { getCodingAgent, missingClaudeKey, getRepoRoot } = await import('../agents/coding-agent.js');
+    if (missingClaudeKey()) {
+      console.warn('[coding] 未配置 ANTHROPIC_API_KEY / CLAUDE_API_KEY,跳过真实编码(codingResult 仅占位)');
+      return { ...inputData, codingResult: '(skipped: missing ANTHROPIC_API_KEY)' };
+    }
+    try {
+      const agent = await getCodingAgent(getRepoRoot());
+      const res = await agent.generate([
+        {
+          role: 'user',
+          content:
+            `你在一个 git 仓库的 feature 分支 \`${inputData.branch}\` 上。请实现以下 issue 对应的代码改动:\n\n` +
+            `**标题**: ${inputData.issueTitle}\n` +
+            (inputData.issueBody ? `**描述**:\n${inputData.issueBody}\n` : '') +
+            '\n要求:\n- 直接修改仓库中的文件(不要只输出代码片段)\n' +
+            '- 保持代码风格一致\n- 完成后简要说明你改了哪些文件、为什么\n' +
+            '- 不要 git commit(后续 commit 步会提交)',
+        },
+      ]);
+      return { ...inputData, codingResult: res.text ?? '(no output)' };
+    } catch (e) {
+      console.warn('[coding] ClaudeSDKAgent 执行异常:', e instanceof Error ? e.message : e);
+      return { ...inputData, codingResult: `(error: ${e instanceof Error ? e.message : e})` };
+    }
   },
 });
 
