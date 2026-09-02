@@ -48,7 +48,9 @@ async function listChats(token) {
   const token = await getTenantToken();
   console.log('[OK] token 获取成功(App ID / Secret 有效)');
 
-  console.log('\n=== 你的群(选一个,把 chat_id 填进 .env 的 FEISHU_RECEIVE_ID,FEISHU_RECEIVE_ID_TYPE 保持默认 chat_id) ===');
+  console.log(
+    '\n=== 你的群(选一个,把 chat_id 填进 .env 的 FEISHU_RECEIVE_ID,FEISHU_RECEIVE_ID_TYPE 保持默认 chat_id) ==='
+  );
   const chats = await listChats(token);
   if (!chats.length) {
     console.log('(空)机器人尚未加入任何群 —— 先在飞书把本应用机器人拉进目标群,再重跑本脚本。');
@@ -57,8 +59,10 @@ async function listChats(token) {
   for (const c of chats) {
     console.log(`  chat_id=${c.chat_id}  name=${c.name || '(未命名)'}`);
   }
-  console.log('\n下一步:把上面某个 chat_id 填入 .env 的 FEISHU_RECEIVE_ID,然后 `node scripts/verify-feishu.js` 做真实推送验证。');
-})().catch((e) => {
+  console.log(
+    '\n下一步:把上面某个 chat_id 填入 .env 的 FEISHU_RECEIVE_ID,然后 `node scripts/verify-feishu.js` 做真实推送验证。'
+  );
+})().catch(e => {
   console.error(e.message || e);
   process.exit(1);
 });

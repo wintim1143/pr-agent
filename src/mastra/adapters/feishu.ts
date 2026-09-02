@@ -109,13 +109,11 @@ interface FeishuCard {
 
 /** 构造飞书 interactive 卡片(对应设计文档 §5.2 的卡片结构)。 */
 export function buildCard(input: FeishuNotifyInput): FeishuCard {
-  const elements: Array<Record<string, unknown>> = [
-    { tag: 'div', text: { tag: 'lark_md', content: input.markdown } },
-  ];
+  const elements: Array<Record<string, unknown>> = [{ tag: 'div', text: { tag: 'lark_md', content: input.markdown } }];
   if (input.buttons && input.buttons.length > 0) {
     elements.push({
       tag: 'action',
-      actions: input.buttons.map((b) => ({
+      actions: input.buttons.map(b => ({
         tag: 'button',
         text: { tag: 'plain_text', content: b.text },
         type: b.type || 'default',
@@ -146,7 +144,9 @@ export function buildDevCompleteCard(ctx: {
     typeof ctx.prNumber === 'number' && ctx.prNumber > 0 ? `**PR**: #${ctx.prNumber}` : '',
     '',
     '请在飞书卡片上点 **🔀 合并** 或 **❌ 拒绝**(按钮回调需 IM 入口,后续接入)。',
-  ].filter(Boolean).join('\n\n');
+  ]
+    .filter(Boolean)
+    .join('\n\n');
   return {
     title: `✅ 开发完成 · #${ctx.issueNumber} ${ctx.issueTitle}`,
     markdown: lines,
@@ -166,10 +166,7 @@ function signWebhook(timestamp: string, secret: string): string {
   return crypto.createHmac('sha256', secret).update(`${timestamp}\n${secret}`).digest('base64');
 }
 
-async function sendViaWebhook(
-  cfg: FeishuConfig,
-  card: FeishuCard
-): Promise<FeishuNotifyResult> {
+async function sendViaWebhook(cfg: FeishuConfig, card: FeishuCard): Promise<FeishuNotifyResult> {
   const body: Record<string, unknown> = { msg_type: 'interactive', card };
   if (cfg.webhookSecret) {
     const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -182,8 +179,7 @@ async function sendViaWebhook(
     body: JSON.stringify(body),
   });
   const raw = await resp.json().catch(() => null);
-  const ok =
-    resp.ok && ((raw as { StatusCode?: number })?.StatusCode === 0 || (raw as { code?: number })?.code === 0);
+  const ok = resp.ok && ((raw as { StatusCode?: number })?.StatusCode === 0 || (raw as { code?: number })?.code === 0);
   return { ok, mode: 'webhook', statusCode: resp.status, raw };
 }
 
@@ -199,7 +195,12 @@ async function getTenantAccessToken(appId: string, appSecret: string): Promise<s
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
   });
-  const j = (await resp.json().catch(() => null)) as { code?: number; msg?: string; tenant_access_token?: string; expire?: number };
+  const j = (await resp.json().catch(() => null)) as {
+    code?: number;
+    msg?: string;
+    tenant_access_token?: string;
+    expire?: number;
+  };
   if (j?.code !== 0 || !j?.tenant_access_token) {
     throw new Error(`获取 tenant_access_token 失败: code=${j?.code} msg=${j?.msg}`);
   }

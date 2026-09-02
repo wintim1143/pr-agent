@@ -11,7 +11,12 @@
 require('dotenv/config');
 
 async function main() {
-  const { getFeishuConfig, missingFeishuConfig, feishuNotify, buildDevCompleteCard } = require('../dist/mastra/adapters/feishu.js');
+  const {
+    getFeishuConfig,
+    missingFeishuConfig,
+    feishuNotify,
+    buildDevCompleteCard,
+  } = require('../dist/mastra/adapters/feishu.js');
 
   console.log('=== 解析后的飞书配置 ===');
   const cfg = getFeishuConfig();
@@ -66,7 +71,7 @@ async function main() {
   }
 }
 
-main().catch((e) => {
+main().catch(e => {
   console.error(e);
   process.exit(1);
 });

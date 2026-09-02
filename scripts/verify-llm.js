@@ -46,9 +46,7 @@ async function main() {
   console.log('\n=== 真实 ping:用 dev-agent 向中转站发一条最小请求 ===');
   const { devAgent } = require('../dist/mastra/agents/dev-agent.js');
   try {
-    const res = await devAgent.generate([
-      { role: 'user', content: 'Reply with the single word: pong' },
-    ]);
+    const res = await devAgent.generate([{ role: 'user', content: 'Reply with the single word: pong' }]);
     const text = typeof res?.text === 'string' ? res.text : JSON.stringify(res).slice(0, 200);
     console.log('[OK] ping 成功,模型回复:', text.slice(0, 200));
   } catch (err) {
@@ -57,7 +55,7 @@ async function main() {
   }
 }
 
-main().catch((e) => {
+main().catch(e => {
   console.error(e);
   process.exit(1);
 });
