@@ -4,9 +4,10 @@
   "description": "",
   "private": true,
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.258",
+    "@mastra/claude": "^0.3.0",
     "@mastra/core": "^1.63.2",
     "@mastra/koa": "^1.7.7",
-    "dotenv": "^17.4.2",
     "@mastra/libsql": "^1.22.2",
     "@midwayjs/bootstrap": "^4.0.0",
     "@midwayjs/core": "^4.0.0",
@@ -15,6 +16,7 @@
     "@midwayjs/logger": "^4.0.0",
     "@midwayjs/validation": "^4.0.0",
     "@midwayjs/validation-joi": "^4.0.0",
+    "dotenv": "^17.4.2",
     "joi": "^17.13.3",
     "mastra": "^1.27.2",
     "zod": "^4.5.4"
