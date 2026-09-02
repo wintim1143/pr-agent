@@ -4,56 +4,48 @@
  * 设计取舍(先读环境再动手,非猜):
  * - `checkout`(建分支) 走本地 `git`(纯本地操作,不需要 GitHub 鉴权)。
  * - `push-open-pr` 走两件事:
- *   1. `git push` —— 鉴权优先级:显式 `GITHUB_TOKEN`(内嵌 HTTPS URL,CI 标准做法) > `gh` 登录态
- *      (走 `gh auth setup-git` 配置的 git credential helper,OAuth 鉴权,本机交互最省事,**无需手动建 token**);
- *   2. `gh pr create` —— 用已安装的 GitHub CLI(`gh`,K5 已装)开 PR,走 GitHub API。
- * - `gh` 二进制路径自动探测:先读 `GH_PATH`,否则 Windows 上探测 `C:\Program Files\GitHub CLI\gh.exe`,
- *   再回退到 PATH 里的 `gh`。这样用户在正常终端跑 `npm start`(gh 在 PATH)时也能用,不强制设 GH_PATH。
- * - owner/repo 优先读 `GITHUB_OWNER`/`GITHUB_REPO`,留空则自动从 `git remote get-url origin` 解析,
- *   因此用户**只需二选一**:填 `GITHUB_TOKEN`,或本机 `gh auth login` + `gh auth setup-git`(免建 token)。
+ *   1. `git push` —— 用显式 `GITHUB_TOKEN` 内嵌 HTTPS URL 推分支(CI 标准做法,不依赖 SSH/gh);
+ *   2. 开 PR / merge —— **全部走 GitHub REST API**(`fetch`),**不依赖 `gh` CLI**(K5 决策:macOS 无
+ *      Homebrew、不引入外部二进制,统一 REST 保证跨平台行为一致)。
+ * - owner/repo 优先读 `GITHUB_OWNER`/`GITHUB_REPO`,留空则自动从 `git remote get-url origin` 解析。
+ * - `GITHUB_TOKEN` 是唯一鉴权来源(fine-grained PAT,需 Contents + Pull requests 写权限)。
  *
  * 重要:本模块**加载时不抛错**(否则拖垮 `npm test` 与 `GET /api/agents` 仅列元数据的场景),
- * 所有校验/报错都延迟到调用 `githubCheckout` / `githubPushAndOpenPR` 时才暴露。
+ * 所有校验/报错都延迟到调用 `githubCheckout` / `githubPushAndOpenPR` / `githubMergePR` 时才暴露。
  */
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
+
+/** 统一 REST 调用:失败(<2xx)抛 `GithubApiError`(含 status + 响应体),供调用方判读。 */
+async function githubRequest<T>(
+  cfg: { owner: string; repo: string; token: string },
+  path: string,
+  init?: { method?: string; body?: unknown }
+): Promise<T> {
+  const resp = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}${path}`, {
+    method: init?.method ?? 'GET',
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    body: init?.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+  const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!resp.ok) {
+    const msg = (raw && (raw.message || raw.errors)) || `HTTP ${resp.status}`;
+    throw new Error(
+      `GitHub API ${init?.method ?? 'GET'} ${path} → ${resp.status}: ${JSON.stringify(msg)}`
+    );
+  }
+  return raw as T;
+}
 
 export interface GithubConfig {
   token: string;
   owner: string;
   repo: string;
   baseBranch: string;
-  ghPath: string;
-  /** true=走 gh 登录态(OAuth 凭证),不依赖 GITHUB_TOKEN */
-  useGhAuth?: boolean;
-}
-
-/** 自动探测 gh 可执行文件路径 */
-function resolveGhPath(): string {
-  if (process.env.GH_PATH) return process.env.GH_PATH;
-  if (process.platform === 'win32') {
-    const candidates = [
-      'C:\\Program Files\\GitHub CLI\\gh.exe',
-      process.env.LOCALAPPDATA ? `${process.env.LOCALAPPDATA}\\Microsoft\\WindowsApps\\gh.exe` : null,
-    ].filter((c): c is string => Boolean(c));
-    for (const c of candidates) {
-      if (fs.existsSync(c)) return c;
-    }
-  }
-  return 'gh';
-}
-
-/** 探测 gh 是否已登录(可走 OAuth 凭证,无需 GITHUB_TOKEN)。仅 github.com。 */
-function ghAuthenticated(ghPath: string): boolean {
-  try {
-    execFileSync(ghPath, ['auth', 'status', '--hostname', 'github.com'], {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 /** 仓库根目录(git 工作树顶层) */
@@ -100,26 +92,17 @@ export function getGithubConfig(): GithubConfig | null {
     owner = owner || parsed?.owner;
     repo = repo || parsed?.repo;
   }
-  if (!owner || !repo) return null;
+  if (!owner || !repo || !token) return null;
 
-  const ghPath = resolveGhPath();
   const baseBranch = process.env.GITHUB_BASE_BRANCH || 'main';
-  // 优先显式 GITHUB_TOKEN(适合 CI);否则探测 gh 登录态(OAuth,适合本机交互)
-  if (token) {
-    return { token, owner, repo, baseBranch, ghPath };
-  }
-  if (ghAuthenticated(ghPath)) {
-    return { token: '', owner, repo, baseBranch, ghPath, useGhAuth: true };
-  }
-  return null;
+  return { token, owner, repo, baseBranch };
 }
 
 /** 返回缺失的配置项(用于验证脚本提示用户去哪补) */
 export function missingGithubConfig(): string[] {
   const miss: string[] = [];
-  const ghPath = resolveGhPath();
-  if (!process.env.GITHUB_TOKEN && !ghAuthenticated(ghPath)) {
-    miss.push('GITHUB_TOKEN(或本机运行 `gh auth login` + `gh auth setup-git` 用 OAuth 凭证,免建 token)');
+  if (!process.env.GITHUB_TOKEN) {
+    miss.push('GITHUB_TOKEN(fine-grained PAT,需 Contents + Pull requests 写权限)');
   }
   let owner = process.env.GITHUB_OWNER;
   let repo = process.env.GITHUB_REPO;
@@ -259,45 +242,87 @@ export async function githubPushAndOpenPR(opts: {
     if (ahead === 0) {
       return { prNumber: 0, prUrl: null, error: 'no-commits-to-push' };
     }
-    // 3) 推送
-    let pushArgs: string[];
-    if (cfg.useGhAuth) {
-      // 走 gh 登录态:git 经 `gh auth setup-git` 配置的 credential helper 用 OAuth 鉴权
-      pushArgs = ['push', 'origin', `HEAD:refs/heads/${branch}`];
-    } else {
-      // 用 token 内嵌 HTTPS URL,不依赖 SSH / credential helper(CI 标准做法)
-      const tokenUrl = `https://x-access-token:${cfg.token}@github.com/${cfg.owner}/${cfg.repo}.git`;
-      pushArgs = ['push', tokenUrl, `HEAD:refs/heads/${branch}`];
-    }
-    execFileSync('git', pushArgs, {
+    // 3) 推送(用 token 内嵌 HTTPS URL,不依赖 SSH / credential helper / gh)
+    const tokenUrl = `https://x-access-token:${cfg.token}@github.com/${cfg.owner}/${cfg.repo}.git`;
+    execFileSync('git', ['push', tokenUrl, `HEAD:refs/heads/${branch}`], {
       cwd: root,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       stdio: 'pipe',
     });
-    // 4) 开 PR(gh 自动从 remote 解析 owner/repo;GITHUB_TOKEN 由 env 传入)
-    const out = execFileSync(
-      cfg.ghPath,
-      [
-        'pr',
-        'create',
-        '--base',
-        base,
-        '--head',
-        branch,
-        '--title',
-        opts.title,
-        '--body',
-        opts.body,
-        '--json',
-        'number,url',
-      ],
-      { cwd: root, env: process.env, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    const json = JSON.parse(out) as { number: number; url: string };
-    return { prNumber: json.number, prUrl: json.url };
+    // 4) 开 PR(走 REST;若该分支已有 open PR 则复用,避免 422 重复建)
+    try {
+      const created = await openPrForBranch(cfg, branch, base, opts.title, opts.body);
+      return { prNumber: created.number, prUrl: created.url };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { prNumber: 0, prUrl: null, error: msg };
+    }
   } catch (e) {
     const err = e as NodeJS.ErrnoException & { stderr?: Buffer | string };
     const msg = err.stderr?.toString() || err.message || String(e);
     return { prNumber: 0, prUrl: null, error: msg };
+  }
+}
+
+/**
+ * 为某分支开 PR(先查已 open 的,存在则复用)。走 REST,不依赖 gh。
+ * 开不了(权限不足 / 无领先提交等)抛错,由调用方 catch 判读。
+ */
+async function openPrForBranch(
+  cfg: GithubConfig,
+  branch: string,
+  base: string,
+  title: string,
+  body: string
+): Promise<{ number: number; url: string }> {
+  // a) 该 head 分支已存在 open PR?复用之
+  const existing = await githubRequest<Array<{ number: number; html_url: string }>>(
+    cfg,
+    `/pulls?state=open&head=${encodeURIComponent(`${cfg.owner}:${branch}`)}`
+  );
+  if (existing.length > 0) {
+    return { number: existing[0].number, url: existing[0].html_url };
+  }
+  // b) 没有则新建
+  const pr = await githubRequest<{ number: number; html_url: string }>(cfg, '/pulls', {
+    method: 'POST',
+    body: { title, head: branch, base, body },
+  });
+  return { number: pr.number, url: pr.html_url };
+}
+
+/**
+ * merge 步:把已开的 PR 以 squash 方式合入 base 分支(走 REST `PUT /pulls/{n}/merge`)。
+ * 合完返回合并状态;不成功(冲突 / 权限不足 / 已被保护规则拦截)抛错由调用方判读。
+ */
+export async function githubMergePR(
+  prNumber: number,
+  opts: { baseBranch?: string } = {}
+): Promise<{
+  merged: boolean;
+  message: string | null;
+  sha: string | null;
+}> {
+  const cfg = getGithubConfig();
+  if (!cfg) {
+    throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN(需 Contents + Pull requests 写权限)');
+  }
+  try {
+    const res = await githubRequest<{
+      merged: boolean;
+      message: string | null;
+      sha: string | null;
+    }>(cfg, `/pulls/${prNumber}/merge`, {
+      method: 'PUT',
+      body: {
+        commit_title: `Merge pull request #${prNumber}`,
+        merge_method: 'squash',
+        base: opts.baseBranch || cfg.baseBranch,
+      },
+    });
+    return res;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`合并 PR #${prNumber} 失败: ${msg}`);
   }
 }
