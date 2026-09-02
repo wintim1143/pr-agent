@@ -16,14 +16,14 @@ status: 待确认
 
 | 项目 | 实际状态 |
 |------|---------|
-| 代码 | `main` 上 2 次提交；8 步 workflow 已串通，但 `checkout / push-open-pr / notify` 全是 TODO 桩 |
+| 代码 | `main` 上 2 次提交；8 步 workflow 已串通；`checkout` / `push-open-pr`(GitHub)仍是 TODO 桩，`notify`(飞书)已接入 adapter |
 | Skills | 6 个 SKILL.md 各约 20 行，只有 prompt 壳；agent 内是 `createSkill` 内联版 |
 | 闸门输出 | **全部是 `string`**（`codingResult` / `testResult` / `reviewResult`），无法做条件判断——这是最大技术债 |
 | 依赖 | **`node_modules` 未安装** |
 | Storage | 无（in-memory，重启丢状态）→ **无法支撑 suspend/resume 等飞书卡片回调** |
 | 测试 | 只有 Midway 自带的 2 个 controller 冒烟，无业务逻辑测试 |
 | 凭据 | `ANTHROPIC_API_KEY` 未设置；`gh` CLI 未安装 |
-| dev-agent 模型 | `openai/gpt-5` → 需要 `OPENAI_API_KEY` |
+| dev-agent 模型 | env 驱动 `OpenAICompatibleConfig`(适配中转站,见 `src/mastra/config.ts` 与 `.env.example`)→ 需 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` |
 
 ## 一、已锁定决策（本次新验证，取代设计文档 §十二 的旧假设）
 
@@ -93,7 +93,7 @@ status: 待确认
 | # | 阻塞项 | 当前状态 | 需要你做的 |
 |---|--------|---------|-----------|
 | B1 | `node_modules` | ❌ 未安装 | `npm i` |
-| B2 | `OPENAI_API_KEY` | ❌ | dev-agent（闸门 agent）当前是 `openai/gpt-5` |
+| B2 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | ❌ | dev-agent 现由 `src/mastra/config.ts` 的 `OpenAICompatibleConfig` 驱动(中转站就绪),三项填好即可;模板见 `.env.example` |
 | B3 | `ANTHROPIC_API_KEY` | ❌ | ClaudeSDKAgent（编码 agent）必需 |
 | B4 | GitHub 凭据 | ❌ `gh` 未装 | 用 `@octokit/rest` + PAT（服务内），或装 `gh` CLI |
 | B5 | 飞书 App ID/Secret | ❓ | 企业自建应用 + 机器人能力 + 长连接模式 |
@@ -289,7 +289,7 @@ P0 地基 ──┬──> P1 飞书入口 ──┐
 ## 六、待你拍板的 3 件事
 
 1. **权限模式**：我推荐 `allowedTools` 白名单 + `dontAsk`（最小权限、行为确定）。若你觉得白名单维护太麻烦，可退到 `acceptEdits`，但**必须**把测试命令加入白名单，否则跑测试时会卡住等确认。
-2. **模型分工**：现在 dev-agent 是 `openai/gpt-5`，编码要用 Claude → 要维护两套 API key。是否统一成 Claude 一家？（我的建议：闸门 agent 用便宜模型控制成本，编码 agent 用 Claude，接受两套 key。）
+2. **模型分工**：dev-agent 现已改为 env 驱动的 `OpenAICompatibleConfig`(Chat Completions,适配中转站),模型名/key/URL 全可配;若后续编码用 Claude,才涉及两套 key。是否统一成 Claude 一家？（我的建议：闸门 agent 用便宜模型控制成本，编码 agent 用 Claude，接受两套 key。）
 3. **飞书凭据**：B5 是否已具备？若还没有，Phase 1 会被阻塞，需要先把这条挪到最后或改用 HTTP 触发临时替代。
 
 ---

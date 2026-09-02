@@ -1,5 +1,6 @@
 import { Agent } from '@mastra/core/agent';
 import { createSkill } from '@mastra/core/skills';
+import { llmModelConfig } from '../config';
 
 /**
  * dev-agent:文档(11-IM驱动的多Agent自动开发工作流设计.md)设计的「自动开发」主控 agent。
@@ -9,7 +10,8 @@ import { createSkill } from '@mastra/core/skills';
  * - 6 个 skill 全部用 createSkill 内联,保证编译期 + 运行期稳定(不依赖 cwd 下的 SKILL.md 路径解析)。
  * - 规范版 SKILL.md 已落在 src/mastra/skills/<name>/SKILL.md(文档 §11.5 要求),作为技能定义存档;
  *   后续若改用 `skills: ['./skills/<name>']` 路径加载,需先确认构建后 cwd 解析基准。
- * - model 用 provider/model 字符串占位;运行时需配置对应 provider + API key 才能 generate。
+ * - model 由 `../config` 的 `llmModelConfig` 提供,全部走环境变量(模型名 / baseURL / apiKey 均可配),
+ *   适配任意 OpenAI 兼容中转站。详见 src/mastra/config.ts 与仓库根 `.env.example`。
  *   GET /api/agents 只列元数据,不触发 generate,故不影响接入验证。
  */
 
@@ -80,6 +82,6 @@ export const devAgent = new Agent({
 需求解析 → 编码 → 测试(强制) → 审核(强制) → commit(强制) → 合并(强制,需用户确认)。
 每个环节按需加载对应 skill。任何闸门不通过,停止并上报,不得跳过。
 遵循仓库 agent.md 的 Git 规范与红线。`,
-  model: 'openai/gpt-5',
+  model: llmModelConfig,
   skills: [requirementParser, coding, codeTesting, codeReview, commitMessage, mergePr],
 });

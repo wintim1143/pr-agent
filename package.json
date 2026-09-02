@@ -6,6 +6,7 @@
   "dependencies": {
     "@mastra/core": "^1.63.2",
     "@mastra/koa": "^1.7.7",
+    "dotenv": "^17.4.2",
     "@mastra/libsql": "^1.22.2",
     "@midwayjs/bootstrap": "^4.0.0",
     "@midwayjs/core": "^4.0.0",

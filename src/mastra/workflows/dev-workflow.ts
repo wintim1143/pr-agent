@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { Workflow, createStep } from '@mastra/core/workflows';
 import type { Mastra } from '@mastra/core';
+import { getFeishuConfig, feishuNotify, buildDevCompleteCard } from '../adapters/feishu';
 
 /**
  * 自动开发 workflow 骨架(对应文档 §六)。
@@ -10,8 +11,9 @@ import type { Mastra } from '@mastra/core';
  *   每个闸门 step 内部调 dev-agent 并让它加载对应 skill(确定性编排,非自主循环)。
  * - merge 是人工关卡:用 execute 里的 `suspend()` 挂起,等用户在飞书卡片点"合并"后
  *   `resume({ approved: true })` 再真正执行合并。
- * - checkout / push-open-pr / notify 依赖 GitHub 与飞书 client,本项目尚未接入,
- *   暂时是 TODO 桩(透传上下文 / 占位值),不影响流程结构跑通。
+ * - checkout / push-open-pr 依赖 GitHub client,本项目尚未接入,目前是 TODO 桩(占位值),
+ *   不影响流程结构跑通;notify 步已接入飞书 adapter(见 `../adapters/feishu`),
+ *   未配置飞书时跳过、推送失败仅告警,不阻断后续合并关卡。
  *
  * 共享上下文 ContextSchema:贯穿全流程,各 step 逐步填充字段。所有 step 的
  * inputSchema/outputSchema 都用它,保证步骤间类型可衔接(TPrevSchema extends TStepInput)。
@@ -161,14 +163,34 @@ const pushOpenPr = createStep({
   },
 });
 
-// 7. notify:飞书推卡片等用户确认(飞书,暂未接入)
+// 7. notify:飞书推开发完成卡片,等用户确认合并(飞书 adapter 已接入)
 const notify = createStep({
   id: 'notify',
   description: '飞书推开发完成卡片,等用户确认合并',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
-    // TODO: 接入飞书 adapter,推卡片(合并 / 拒绝按钮,callback_id 内嵌 issue 号)
+    // 接入飞书 adapter:推开发完成卡片(合并/拒绝按钮,callback_id 内嵌 issue 号)。
+    // 未配置飞书 → 跳过通知,不阻断流程(后续 merge 步仍会 suspend 等人确认)。
+    // 配置但推送失败 → 仅告警,不阻断(按钮回调 resume 属后续 IM 入口工作)。
+    if (!getFeishuConfig()) {
+      return inputData;
+    }
+    try {
+      const res = await feishuNotify(
+        buildDevCompleteCard({
+          issueNumber: inputData.issueNumber,
+          issueTitle: inputData.issueTitle,
+          branch: inputData.branch,
+          prNumber: inputData.prNumber,
+        })
+      );
+      if (!res.ok) {
+        console.warn(`[notify] 飞书推送失败(mode=${res.mode}):`, res.error || JSON.stringify(res.raw));
+      }
+    } catch (e) {
+      console.warn('[notify] 飞书推送异常:', e instanceof Error ? e.message : e);
+    }
     return inputData;
   },
 });
