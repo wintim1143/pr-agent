@@ -15,6 +15,11 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
+  // 源码里相对 import 因 tsconfig module:NodeNext 必须带 .js 后缀(如 from './guard.js')。
+  // jest/ts-jest 不会自动把 .js 回退解析到 .ts,故用 moduleNameMapper 把相对 .js 引用映射回 .ts。
+  moduleNameMapper: {
+    '^(\\.{1,2}/.*)\\.js$': '$1',
+  },
   // .tmp/verify/ 是一次性验证脚本(见 .gitignore),不是测试,不能被 jest 收集。
   testPathIgnorePatterns: ['<rootDir>/test/fixtures', '<rootDir>/.tmp/'],
   coveragePathIgnorePatterns: ['<rootDir>/test/', '<rootDir>/.tmp/'],

@@ -30,3 +30,7 @@ mastra.db-wal
 # WorkBuddy 项目级工作目录:memory(项目记忆)+ settings.local.json(本地权限/沙箱配置)。
 # 均属本地/不共享,不入库。
 .workbuddy/
+
+# Claude Code 本地运行时目录(ClaudeSDKAgent 执行时生成,含 skills 缓存等)。
+# 每台机器/每次运行都可能不同,不入库。
+.claude/
