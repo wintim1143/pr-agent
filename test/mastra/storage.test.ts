@@ -6,6 +6,38 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 /**
+ * 关闭一个 storage 连接(若存在 close 方法)。
+ * 用于释放 Windows 下 LibSQL 持有的文件锁(-wal/-shm)。
+ */
+async function closeStorage(storage: unknown): Promise<void> {
+  if (storage && typeof (storage as { close?: unknown }).close === 'function') {
+    await (storage as { close: () => Promise<void> }).close();
+  }
+}
+
+/**
+ * 删除文件,遇 EBUSY/EPERM 时短暂重试。
+ * Windows 上 LibSQL 的 close() 可能在下一个 tick 才真正释放文件锁,
+ * 同步 rmSync 紧跟其后会报 EBUSY,因此这里退避重试几次。
+ */
+async function removeWithRetry(file: string, attempts = 10): Promise<void> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(file, { force: true });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'EMFILE') {
+        // 让出事件循环,等锁释放
+        await new Promise((r) => setTimeout(r, 50));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
  * storage 持久化回归测试。
  *
  * 守护的是一条很容易被悄悄破坏的架构约束:
@@ -21,6 +53,9 @@ describe('Mastra storage 持久化', () => {
   const MASTRA_DB_PATH = process.env.MASTRA_DB_PATH;
   let tmpDb: string;
   let mastra: InstanceType<typeof Mastra>;
+  // instanceA/instanceB 在测试内创建,各自可能持有独立连接,需在 afterAll 一并关闭
+  let instanceA: InstanceType<typeof Mastra>;
+  let instanceB: InstanceType<typeof Mastra>;
 
   beforeAll(async () => {
     // 指向临时库,避免污染开发库。必须在 import src/mastra 之前设置:
@@ -32,14 +67,21 @@ describe('Mastra storage 持久化', () => {
     mastra = mod.mastra;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // 先关闭所有 storage 连接,释放 Windows 下 LibSQL 持有的文件锁(-wal/-shm)。
+    // 否则紧跟着的 rmSync 会报 EBUSY: resource busy or locked,并泄漏一个 %TEMP%/.db。
+    // 模块级 mastra、instanceA、instanceB 各自可能持有独立连接,需全部关闭。
+    await closeStorage(mastra.getStorage());
+    await closeStorage(instanceA?.getStorage());
+    await closeStorage(instanceB?.getStorage());
+
     if (MASTRA_DB_PATH === undefined) {
       delete process.env.MASTRA_DB_PATH;
     } else {
       process.env.MASTRA_DB_PATH = MASTRA_DB_PATH;
     }
     for (const suffix of ['', '-shm', '-wal']) {
-      rmSync(`${tmpDb}${suffix}`, { force: true });
+      await removeWithRetry(`${tmpDb}${suffix}`);
     }
   });
 
@@ -78,13 +120,13 @@ describe('Mastra storage 持久化', () => {
       .commit();
 
     // 第一个实例:启动并挂起
-    const instanceA = new Mastra({ workflows: { probe: wf }, storage });
+    instanceA = new Mastra({ workflows: { probe: wf }, storage });
     const runA = await instanceA.getWorkflow('probe').createRun();
     const started = await runA.start({ inputData: { issueNumber: 42 } });
     expect(started.status).toBe('suspended');
 
     // 第二个实例:模拟另一个进程(或卡片回调请求),只拿 runId 恢复
-    const instanceB = new Mastra({ workflows: { probe: wf }, storage });
+    instanceB = new Mastra({ workflows: { probe: wf }, storage });
     const runB = await instanceB.getWorkflow('probe').createRun({ runId: runA.runId });
     const resumed = await runB.resume({
       step: approvalGate,

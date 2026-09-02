@@ -31,7 +31,7 @@
 - `Agent.model` 接受 `'provider/model'` 字符串（构造期不解析，`GET /api/agents` 不触发 generate，不影响接入验证）。
 - `Agent.skills` 接受 `createSkill(...)` **内联实例**（稳定，推荐）或 `'./skills/<name>'` 路径（依赖运行期 cwd 解析，构建后基准不确定，慎用）。
 - `@mastra/koa` 的 `MastraServer` 构造参数 `app` 期望**标准 Koa 实例类型**，而 Midway 注入的 `this.app` 类型是 `koa.Application`(MidwayKoaApplication)，**编译期类型对不上，需 `as any` 桥接；运行期兼容（已验证）**。此 `as any` 仅允许出现在 `registerMastra` 一处。
-- Mastra 报 `No storage configured` 是 **warning 非 error**（in-memory，重启丢数据）；真接 agent/workflow 状态后需配 `@mastra/libsql` / `@mastra/pg` 等持久化 storage。
+- **storage 是必配项，不是可选项**。`merge` 步骤用 `suspend()` 挂起、飞书卡片回调用 `createRun({ runId })` 重建 run 来 `resume()`；这条跨请求恢复链路**强依赖持久化 storage**——实测(2026-09-01)不配 storage 时直接报 `This workflow run was not suspended`（`test/mastra/storage.test.ts` 守护此约束）。`No storage configured` 虽打印为 warning，但本项目的 approve-merge 闸门会因此失效，故必须配 `@mastra/libsql`（已配，见 `src/mastra/index.ts`）。
 
 ## 3. 两条运行路径与端口
 | 路径 | 启动命令 | 端口 | 用途 |

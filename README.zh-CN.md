@@ -1,24 +1,33 @@
-# my_midway_project
+# pr-agent（Midway + Mastra 多 Agent 自动开发）
+
+基于 Midway 嵌入 Mastra 的多 Agent 自动开发工作流：IM（飞书）触发 → 需求拆解 → 编码 → 自测 → 评审 → 人工 approve → 开 PR。
+
+> 架构与运行约束见仓库根 `agent.md`；工作流设计见 `11-IM驱动的多Agent自动开发工作流设计.md`。
 
 ## 快速入门
-
-<!-- 在此次添加使用文档 -->
-
-如需进一步了解，参见 [midway 文档][midway]。
 
 ### 本地开发
 
 ```bash
 $ npm i
-$ npm run dev
-$ open http://localhost:7001/
+$ npm run dev        # Midway 嵌入路径,端口 8001
+$ open http://localhost:8001/
 ```
 
-### 部署
+### 构建与启动（生产路径）
 
 ```bash
-$ npm start
+$ npm run build
+$ npm start          # 端口 8001,路由 /api/agents、/api/workflows
 ```
+
+### 单元测试
+
+```bash
+$ npm test
+```
+
+如需进一步了解，参见 [midway 文档][midway]。
 
 ### 内置指令
 
