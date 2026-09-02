@@ -55,11 +55,7 @@ const ContextSchema = z.object({
  * 用 dev-agent 跑质量闸门 skill,输出结构化结果(文档 P3-1)。
  * 依据 `structuredOutput` 从 `res.object` 读取,保证条件边能按结构化字段判定。
  */
-async function runGate<S extends z.ZodTypeAny>(
-  mastra: Mastra,
-  instruction: string,
-  schema: S,
-): Promise<z.infer<S>> {
+async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: string, schema: S): Promise<z.infer<S>> {
   const agent = mastra.getAgent('dev-agent');
   const res = await agent.generate(instruction, {
     structuredOutput: { schema, errorStrategy: 'strict' },
@@ -96,7 +92,7 @@ const coding = createStep({
   execute: async ({ mastra, inputData }) => {
     const text = await runPlain(
       mastra,
-      `使用 coding skill。需求:${inputData.issueTitle}\n${inputData.issueBody}\n请在当前 feature 分支上产出代码改动。`,
+      `使用 coding skill。需求:${inputData.issueTitle}\n${inputData.issueBody}\n请在当前 feature 分支上产出代码改动。`
     );
     return { ...inputData, codingResult: text };
   },
@@ -112,7 +108,7 @@ const testStep = createStep({
     const testResult = await runGate(
       mastra,
       `使用 code-testing skill 对当前改动运行测试,输出结构化结果 { passed: boolean, report: string }。需求:${inputData.issueTitle}`,
-      TestGateSchema,
+      TestGateSchema
     );
     // TODO: passed=false 时回到 coding 重做(条件边 branch/dowhile,见文档 §十二)
     return { ...inputData, testResult };
@@ -129,7 +125,7 @@ const review = createStep({
     const reviewResult = await runGate(
       mastra,
       `使用 code-review skill 审核当前改动,输出结构化结果 { decision: 'approve' | 'request-changes', comments: string[] }。需求:${inputData.issueTitle}`,
-      ReviewGateSchema,
+      ReviewGateSchema
     );
     // TODO: decision=request-changes 时回到 coding(条件边,见文档 §十二)
     return { ...inputData, reviewResult };
@@ -146,7 +142,7 @@ const commit = createStep({
     const commitResult = await runGate(
       mastra,
       `使用 commit-message skill 为改动生成 commit message,关联 issue #${inputData.issueNumber},输出结构化结果 { message: string, lintPassed: boolean }。`,
-      CommitGateSchema,
+      CommitGateSchema
     );
     return { ...inputData, commitResult };
   },
@@ -186,11 +182,14 @@ const merge = createStep({
   execute: async ({ mastra, inputData, suspend, resumeData }) => {
     // 未收到用户确认 → 挂起,等飞书卡片点"合并"后 resume({ approved: true })
     if (!resumeData || !(resumeData as { approved?: boolean }).approved) {
-      return suspend({ waitingFor: 'merge-approval', issueNumber: inputData.issueNumber });
+      return suspend({
+        waitingFor: 'merge-approval',
+        issueNumber: inputData.issueNumber,
+      });
     }
     const text = await runPlain(
       mastra,
-      `使用 merge-pr skill 执行 squash merge 合入 main 并关闭 issue #${inputData.issueNumber}。`,
+      `使用 merge-pr skill 执行 squash merge 合入 main 并关闭 issue #${inputData.issueNumber}。`
     );
     return { ...inputData, mergeResult: text };
   },
