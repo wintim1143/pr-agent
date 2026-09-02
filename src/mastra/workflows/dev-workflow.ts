@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { Workflow, createStep } from '@mastra/core/workflows';
 import type { Mastra } from '@mastra/core';
 import { getFeishuConfig, feishuNotify, buildDevCompleteCard } from '../adapters/feishu';
-import { getGithubConfig, githubCheckout, githubPushAndOpenPR, gitCommit } from '../adapters/github';
+import { getGithubConfig, githubCheckout, githubPushAndOpenPR, githubMergePR, gitCommit } from '../adapters/github';
 
 /**
  * 自动开发 workflow 骨架(对应文档 §六)。
@@ -67,13 +67,6 @@ async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: stri
   // structuredOutput 保证 object 符合 schema 形状,此处断言(泛型无法自动推导)
   return res.object as z.infer<S>;
 }
-/** 用 dev-agent 跑不需要结构化输出的 step(如 coding / merge),返回纯文本。 */
-async function runPlain(mastra: Mastra, instruction: string): Promise<string> {
-  const agent = mastra.getAgent('dev-agent');
-  const res = await agent.generate(instruction);
-  return res.text ?? '';
-}
-
 /** 生成 PR 描述(供 push-open-pr 步使用) */
 function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
   const lines = [
@@ -265,13 +258,13 @@ const notify = createStep({
   },
 });
 
-// 8. merge(强制,需用户确认):合并 PR skill + suspend/resume
+// 8. merge(强制,需用户确认):suspend 等人点"合并"→ REST squash merge 合入 base
 const merge = createStep({
   id: 'merge',
-  description: '用户确认后调用合并 PR skill 执行 squash merge',
+  description: '用户确认后经 GitHub REST API 对 PR 执行 squash merge',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ mastra, inputData, suspend, resumeData }) => {
+  execute: async ({ inputData, suspend, resumeData }) => {
     // 未收到用户确认 → 挂起,等飞书卡片点"合并"后 resume({ approved: true })
     if (!resumeData || !(resumeData as { approved?: boolean }).approved) {
       return suspend({
@@ -279,11 +272,26 @@ const merge = createStep({
         issueNumber: inputData.issueNumber,
       });
     }
-    const text = await runPlain(
-      mastra,
-      `使用 merge-pr skill 执行 squash merge 合入 main 并关闭 issue #${inputData.issueNumber}。`
-    );
-    return { ...inputData, mergeResult: text };
+    // 已确认:真实合并。没开出 PR(prNumber=0)就没东西可合,标记失败供上层判读。
+    if (!inputData.prNumber || inputData.prNumber <= 0) {
+      const mergeResult = `merge-skipped: 无已开 PR(prNumber=${inputData.prNumber ?? 0}),无法合并`;
+      console.warn(`[merge] ${mergeResult}`);
+      return { ...inputData, mergeResult };
+    }
+    try {
+      const res = await githubMergePR(inputData.prNumber);
+      const mergeResult = res.merged
+        ? `merge-ok: PR #${inputData.prNumber} 已 squash 合入(sha=${res.sha})`
+        : `merge-fail: ${res.message ?? '未知原因'}`;
+      if (!res.merged) console.warn(`[merge] ${mergeResult}`);
+      else console.log(`[merge] ${mergeResult}`);
+      return { ...inputData, mergeResult };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const mergeResult = `merge-error: ${msg}`;
+      console.error(`[merge] ${mergeResult}`);
+      return { ...inputData, mergeResult };
+    }
   },
 });
 
