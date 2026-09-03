@@ -43,13 +43,13 @@
 - `npx mastra dev` 要求 `src/mastra/index.ts` 导出名为 `mastra` 的 `Mastra` 实例（否则报 `No index.ts and no file-based primitives found`）。本项目已满足。
 
 ## 4. Git 规范（硬约束，不可违反）
-- **分支模型**：trunk-based + 短期 feature 分支 `feat/<issue-number>-<short-slug>`（如 `feat/123-user-login`），合并后即删。
+- **分支模型**：trunk-based + 短期 feature 分支 `feat/<issue-number>-<short-slug>`（如 `feat/123-user-login`），合并后即删。**本仓库(pr-agent)自身开发允许直接在 `main` 上修改**（用户决策 2026-09-03），不再强制开 feature 分支 / 走 PR；feature 分支仅用于需要 review 的较大改动，非必需。
 - **commit**：Conventional Commits，`<type>(<scope>): <subject>`，末尾 `Closes #<issue>`；`type` ∈ feat/fix/refactor/test/docs/chore/perf；subject 祈使句、≤50 字符；必须过 `commitlint`。
 - **合并**：squash merge 到 `main`，前期需**用户确认**。
 - **红线（绝对禁止）**：
-  1. Agent 只能操作自己的 feature 分支。
-  2. 禁止 push / force push `main`；禁止 rebase `main`。
-  3. 所有提交必须过测试 + 审核 skill，否则不许 commit。
+  1. （仅针对 auto-dev agent 操作**目标仓库**时）Agent 只能操作自己的 feature 分支；**本仓库(pr-agent)开发不受此限**（允许直接改 main）。
+  2. 禁止 `force push main`；禁止 `rebase main`。普通 `push main` 允许（直接开发本仓库）。
+  3. 所有提交**在当前需求完成后统一验证一次**（lint/build/test 或按需求选定范围），不要求每次提交都过测试；关键改动仍建议经 review。
   4. 合并必须用户确认（前期）或 CI 门禁 + 有权限者批准（多人后）。
 - 禁止在代码里硬编码密钥（用 env / secret 管理）。
 
@@ -91,7 +91,7 @@
 - 所有对外动作（创建/合并 PR）都要可追踪、可回滚。
 
 ## 8. 不要做的事
-- 不要绕过 workflow 直接改 `main` / 直接合并 PR。
+- 不要绕过 workflow 的审核闸门直接合并 PR（本仓库允许直接改 `main`，但关键改动仍建议经 review）。
 - 不要为每个小改动起服务做运行期测试（见 §6）。
 - 不要在代码里硬编码密钥。
 - 不要凭旧文档瞎写 Mastra API（见 §2.1，以本仓库已装版本的 `.d.ts` 为准）。
