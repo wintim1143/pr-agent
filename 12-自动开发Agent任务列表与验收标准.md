@@ -54,11 +54,11 @@ status: 待确认
 
 | 模式 | 行为 | 结论 |
 |------|------|------|
-| `dontAsk` | `allowedTools` 白名单内放行，白名单外**直接拒绝**（不弹窗、不回调） | ✅ **推荐起步**。最小权限，行为确定，不会静默依赖"没人回答会怎样" |
-| `acceptEdits` | **cwd 内**的文件操作自动放行，Bash 等其他工具仍需确认 | ⚠️ 会卡在 Bash（跑测试就要 Bash）。若采用，必须把测试命令加进白名单 |
-| `bypassPermissions` | 全部放行 | ❌ **禁用**。等同给 agent 完整系统权限，且 `allowedTools` 在此模式下不具约束力 |
+| `dontAsk` | `allowedTools` 白名单内放行，白名单外**直接拒绝**（不弹窗、不回调） | 备选（切回非 bypass 时生效） |
+| `acceptEdits` | **cwd 内**的文件操作自动放行，Bash 等仍需确认 | ⚠️ 会卡在 Bash（跑测试要 Bash），不可用于无人值守 |
+| `bypassPermissions` | 全部放行（含 Bash） | ✅ **已拍板采用**（无人值守零弹窗）；硬拦截由 `guard.ts` PreToolUse hook 承担，非 `allowedTools` |
 
-**起步方案：`allowedTools` 白名单 + `permissionMode: 'dontAsk'`，配套 `maxTurns` 与 `maxBudgetUsd`。**
+**已拍板方案（2026-09-03）：`permissionMode: 'bypassPermissions'` + `allowDangerouslySkipPermissions: true`，配套 `maxTurns` 与 `maxBudgetUsd`。真正的硬拦截靠 PreToolUse hook → `guard.ts`（fail-closed），与 permissionMode 无关。`allowedTools`/`disallowedTools` 仅作防御纵深。详见 `agent.md` §4.1。**
 
 > 注意：子 agent 会**强制继承**父 agent 的权限模式，无法在子级覆盖。
 
@@ -73,13 +73,13 @@ status: 待确认
 
 ### 1.5 落地顺序
 
-**先飞书入口**（本次拍板），再编码引擎，再闸门，最后 PR/合并。
+**先跑通无 IM 闭环**（D5 已拍板①）：编码引擎 → 闸门 → PR/合并 先用 HTTP 触发跑通主轴；飞书入口(inbound)推迟到 Phase 1 具体实现。
 
 ---
 
 ## 二、全局红线（任何阶段都不得违反）
 
-1. Agent 只能操作自己的 feature 分支；**禁止 push / force push `main`**；禁止 rebase `main`。
+1. Agent 只能操作自己的 feature 分支（**仅限目标仓库**）；本仓库(pr-agent)开发允许直接改 `main`。**禁止 force push `main`、禁止 rebase `main`**；普通 `push main` 允许。
 2. **受保护路径**：`agent.md`、`.github/`、`.env*`、`src/mastra/workflows/`、`src/mastra/agents/` —— 自举期间 Agent **不得修改**，用 `disallowedTools` + PreToolUse hook + 分支保护三重拦截。
 3. 不通过测试与审核，**不得 commit**。
 4. 合并**必须人类确认**（飞书卡片）。
@@ -115,7 +115,7 @@ status: 待确认
 |------|------|------|
 | P0-1 | 依赖安装与流水线跑通 | `npm i`；`npm run build` / `npm test` / `npm run lint` 全绿 |
 | P0-2 | 配置与密钥管理 | 统一 config schema（zod 校验，缺 key 启动即报错并指明缺哪个）；`.env.example`；`.gitignore` 加 `.env*` |
-| P0-3 | **RepoTarget 抽象** 🔴 | `repoPath / owner / repo / baseBranch` 单一配置源；git 命令与 `sdkOptions.cwd` 都读它 |
+| P0-3 | ~~RepoTarget 抽象~~ ✅ 经实测非硬编码 | `repoRoot()`/`getRepoRoot()` 已统一用 `git rev-parse --show-toplevel`，无需额外配置源；Phase 6 多仓库时再补 `repoPath` 配置项 |
 | P0-4 | **Mastra Storage 持久化** 🔴 | 接 `@mastra/libsql`（本地 SQLite 起步）；workflow run 状态重启后可恢复 |
 
 **验收标准（AC0）**
@@ -288,18 +288,19 @@ P0 地基 ──┬──> P1 飞书入口 ──┐
 
 ## 六、待你拍板的 3 件事
 
-1. **权限模式**：我推荐 `allowedTools` 白名单 + `dontAsk`（最小权限、行为确定）。若你觉得白名单维护太麻烦，可退到 `acceptEdits`，但**必须**把测试命令加入白名单，否则跑测试时会卡住等确认。
-2. **模型分工**：dev-agent 现已改为 env 驱动的 `OpenAICompatibleConfig`(Chat Completions,适配中转站),模型名/key/URL 全可配;若后续编码用 Claude,才涉及两套 key。是否统一成 Claude 一家？（我的建议：闸门 agent 用便宜模型控制成本，编码 agent 用 Claude，接受两套 key。）
-3. **飞书凭据**：B5 是否已具备？若还没有，Phase 1 会被阻塞，需要先把这条挪到最后或改用 HTTP 触发临时替代。
+1. **权限模式**：✅ 已拍板 —— `bypassPermissions` + `allowDangerouslySkipPermissions`，硬拦截靠 `guard.ts` PreToolUse hook（fail-closed）。（见 `agent.md` §4.1）
+2. **模型分工**：✅ 已拍板 —— 闸门用中转站(`LLM_*`/glm 系)，编码用 ClaudeSDKAgent 走 lanfengai（已注入 `coding-agent.ts:122-147`）。接受两套 key。
+3. **飞书凭据**：🟠 B5 是否具备仍待确认；但 D5 已拍板「先无 IM 闭环」，飞书 inbound 推迟到 Phase 1，故不阻塞主轴。
+4. **目标仓库（D4）**：🟠 自举(改本仓库) vs 独立 demo 仓库，待拍板。
 
 ---
 
 ## 七、执行纪律
 
 - 每个工单开工前读 `agent.md`；改完 Mastra API 事实，同步更新 `agent.md` §2.1。
-- 小改动只跑 `npm run build` 做类型校验；**一个完整阶段告一段落才起服务做运行期验证**（`agent.md` §6）。
+- 测试节奏（2026-09-03 新规）：**不每文件/每提交跑测试**；一个需求完成后统一跑一次 `lint + build + test` 作收尾验证（`agent.md` §4 红线 3）。小改动可只跑 `npm run build` 做类型校验。
 - 每个阶段验收不通过 → 不进入下一阶段。红线项（AC2-2 / AC2-3 / AC3-2）一票否决。
-- 改动走 `feat/<issue>-<slug>` 分支 + Conventional Commits + squash merge，**即使改的是本仓库自己也照走**。
+- 本仓库(pr-agent)开发允许直接改 `main`（用户决策 2026-09-03）；较大改动仍建议走 `feat/<issue>-<slug>` 分支 + Conventional Commits + squash merge。
 
 ## 关联
 

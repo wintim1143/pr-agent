@@ -53,6 +53,16 @@
   4. 合并必须用户确认（前期）或 CI 门禁 + 有权限者批准（多人后）。
 - 禁止在代码里硬编码密钥（用 env / secret 管理）。
 
+### 4.1 编码 Agent 权限模型（用户拍板 2026-09-03）
+- **采用 `permissionMode: 'bypassPermissions'` + `allowDangerouslySkipPermissions: true`**（见 `src/mastra/agents/coding-agent.ts`）。
+  - 理由：无人值守流水线必须零弹窗；`dontAsk` / `acceptEdits` 会在 Bash（跑测试/构建）时卡死 workflow，不可用于自动开发。
+  - `bypassPermissions` 下 `allowedTools` 不具约束力，故**真正的硬拦截不依赖它**。
+- **唯一可靠的硬拦截点 = PreToolUse hook → `src/mastra/agents/guard.ts`**（fail-closed：受保护路径 + 危险命令 + 受保护路径白名单，与 `permissionMode` 无关）。
+  - 受保护路径：`agent.md`、`.github/**`、`.env*`、`src/mastra/workflows/**`、`src/mastra/agents/**`（自举期禁改自身行为约束）。
+  - 危险命令：12 条（force push / 删库 / 改系统配置等），见 `guard.ts` 的 `DANGEROUS_COMMANDS`。
+  - `allowedTools` / `disallowedTools` 仍保留作**防御纵深**（断联网工具防数据外泄），但非主拦截手段。
+- 此口径为项目权威结论；`12-任务列表` §1.2 的权限模式讨论以本条为准（统一为 `bypassPermissions`，不再列 `dontAsk` 为推荐项）。
+
 ## 5. Skill 使用约定
 - 每个质量闸门（需求解析/编码/测试/审核/commit/合并）都是一个 Mastra skill，**不可跳过**。
 - skill 见 `src/mastra/skills/<name>/SKILL.md`，格式遵循 Agent Skills spec（frontmatter 必需 `name`/`description`）。
