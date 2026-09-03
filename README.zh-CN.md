@@ -2,7 +2,7 @@
 
 基于 Midway 嵌入 Mastra 的多 Agent 自动开发工作流：IM（飞书）触发 → 需求拆解 → 编码 → 自测 → 评审 → 人工 approve → 开 PR。
 
-> 架构与运行约束见仓库根 `agent.md`；工作流设计见 `11-IM驱动的多Agent自动开发工作流设计.md`。
+> 架构与运行约束见仓库根 `agent.md`；规划（路线图 + 各里程碑卡）见 `milestones/README.md`。旧 `11-/12-/13-` 文档已归档至 `docs/archive/`，仅作历史参考。
 
 ## 快速入门
 

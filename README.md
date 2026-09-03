@@ -2,7 +2,7 @@
 
 A Midway-embedded Mastra multi-agent auto-development workflow: IM (Feishu/Lark) trigger → requirement breakdown → coding → self-test → review → human approve → open PR.
 
-> Architecture and runtime constraints: see `agent.md` at repo root. Workflow design: `11-IM驱动的多Agent自动开发工作流设计.md`.
+> Architecture and runtime constraints: see `agent.md` at repo root. Planning (roadmap + per-milestone cards): `milestones/README.md`. The legacy `11-/12-/13-` planning docs are archived under `docs/archive/` as historical reference only.
 
 ## QuickStart
 

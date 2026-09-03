@@ -5,6 +5,8 @@ created: 2026-08-31
 
 # IM 驱动的多 Agent 自动开发工作流设计
 
+> ⚠️ **已归档**：本文档是旧 S0–S6 纵向切层规划的产物，已被 `milestones/` 取代。新规划（路线图 + 各里程碑卡）以 `milestones/README.md` 为准；本文仅作历史参考，不再更新。
+
 > 一句话摘要：用户在飞书里提需求 → 系统转成 GitHub issue → 审核人标记"可开发" → Agent 自动开发（编码 → 测试 → 审核 → commit → 开 PR）→ 用户确认合并 PR。全程由 Mastra workflow 编排，每个质量闸门都是「强制执行的 skill」（Mastra 原生 Agent Skills），git 全链路走 Conventional Commits + 语义化版本。**开工前先定义 `agent.md` 固化协作约定，Mastra 用原生 skills 机制落地 6 个闸门 skill。**
 
 ## 一、定位与背景

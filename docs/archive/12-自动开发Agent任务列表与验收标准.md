@@ -6,6 +6,8 @@ status: 待确认
 
 # pr-agent 任务列表与分阶段验收标准
 
+> ⚠️ **已归档**：本文档是旧 S0–S6 纵向切层规划的产物，已被 `milestones/` 取代。新规划（路线图 + 各里程碑卡）以 `milestones/README.md` 为准；本文仅作历史参考，不再更新。
+
 > 一句话最终目标：**在飞书里 @机器人 提一句需求，机器人自动把它变成 GitHub issue；人点"可开发"后，Agent 在指定仓库的 feature 分支上改代码、跑测试、过审核、生成合规 commit、开 PR；人点"合并"后 squash 合入 main 并关闭 issue。全链路走真实 GitHub，每个质量闸门由 Mastra workflow 强制不可跳过。**
 
 本文档是后续所有会话的**唯一计划真相源**。开工前先读 `agent.md`（行为约束），再读本文档（任务与验收）。
