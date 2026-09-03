@@ -2,7 +2,9 @@ import { resolve } from 'node:path';
 import { Mastra } from '@mastra/core';
 import { LibSQLStore } from '@mastra/libsql';
 import { devAgent } from './agents/dev-agent';
+import { insightAgent } from './agents/insight-agent';
 import { devWorkflow } from './workflows/dev-workflow';
+import { insightWorkflow } from './workflows/insight-workflow';
 
 /**
  * Storage 数据库文件位置(绝对路径)。
@@ -45,8 +47,10 @@ export const mastra = new Mastra({
   }),
   agents: {
     'dev-agent': devAgent,
+    'insight-agent': insightAgent,
   },
   workflows: {
     'dev-workflow': devWorkflow,
+    'insight-workflow': insightWorkflow,
   },
 });

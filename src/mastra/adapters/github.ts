@@ -18,7 +18,7 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
 /** 统一 REST 调用:失败(<2xx)抛 `GithubApiError`(含 status + 响应体),供调用方判读。 */
-async function githubRequest<T>(
+export async function githubRequest<T>(
   cfg: { owner: string; repo: string; token: string },
   path: string,
   init?: { method?: string; body?: unknown }

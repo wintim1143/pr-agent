@@ -187,7 +187,7 @@ async function sendViaWebhook(cfg: FeishuConfig, card: FeishuCard): Promise<Feis
 
 let tokenCache: { token: string; exp: number } | null = null;
 
-async function getTenantAccessToken(appId: string, appSecret: string): Promise<string> {
+export async function getTenantAccessToken(appId: string, appSecret: string): Promise<string> {
   const now = Date.now();
   if (tokenCache && tokenCache.exp > now + 60_000) return tokenCache.token;
   const resp = await fetch(`${FEISHU_DOMAIN}/auth/v3/tenant_access_token/internal`, {
@@ -226,6 +226,60 @@ async function sendViaApp(cfg: FeishuConfig, card: FeishuCard): Promise<FeishuNo
   const raw = await resp.json().catch(() => null);
   const ok = resp.ok && (raw as { code?: number })?.code === 0;
   return { ok, mode: 'app', statusCode: resp.status, raw };
+}
+
+/**
+ * 拉取群聊历史消息(M1-3 收消息,轮询模式)。
+ *
+ * 仅自建应用模式可用(Webhook 机器人无读消息权限):用 tenant_access_token 调
+ * `GET /open-apis/im/v1/messages?container_id_type=chat&container_id={chatId}&start_time={ts}&sort_type=ByCreateTimeAsc`。
+ * 返回按时间升序排列的消息(已解析 content 文本),供 inbound 轮询 + 幂等去重使用。
+ *
+ * 前置(飞书侧):机器人已入群 + 开通 `im:message.group_msg`(群聊必需)+ `im:message` 读权限;
+ * 群不能开启保密模式(否则 231203)。不满足时由调用方降级(HTTP 触发 + 仅发不收)。
+ */
+export interface FeishuInboundMessage {
+  messageId: string;
+  text: string;
+  senderId: string;
+  createTime: number;
+}
+
+export async function feishuListMessages(
+  chatId: string,
+  sinceTs: number
+): Promise<FeishuInboundMessage[]> {
+  const cfg = getFeishuConfig();
+  if (!cfg || cfg.mode !== 'app') {
+    throw new Error(
+      '飞书收消息仅支持自建应用模式:需 FEISHU_APP_ID + FEISHU_APP_SECRET + FEISHU_RECEIVE_ID,且机器人已入群'
+    );
+  }
+  const token = await getTenantAccessToken(cfg.appId as string, cfg.appSecret as string);
+  const url =
+    `${FEISHU_DOMAIN}/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(
+      chatId
+    )}&start_time=${sinceTs}&sort_type=ByCreateTimeAsc`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  const j = (await resp.json().catch(() => null)) as { code?: number; msg?: string; data?: { items?: any[] } } | null;
+  if (j?.code !== 0) {
+    throw new Error(`拉取飞书消息失败: code=${j?.code} msg=${j?.msg}`);
+  }
+  const items = j?.data?.items ?? [];
+  return items.map((it: any) => {
+    let text = '';
+    try {
+      text = JSON.parse(it.content ?? '{}').text ?? '';
+    } catch {
+      text = '';
+    }
+    return {
+      messageId: it.message_id as string,
+      text,
+      senderId: (it.sender?.sender_id as string) ?? '',
+      createTime: Number(it.create_time ?? 0),
+    };
+  });
 }
 
 /**

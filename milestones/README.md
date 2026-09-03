@@ -31,7 +31,7 @@
 
 | 里程碑 | 名称 | 端到端演示的效果 | 是否写目标仓库 | 状态 |
 |---|---|---|---|---|
-| **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | 进行中 |
+| **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ 已完成（AC-3 洞察内容受中继不稳定影响暂降级） |
 | **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | 待开始 |
 | **M3** | 完整 PR 闭环 | push + 开 PR + 飞书卡片确认 → squash merge | 是 | 待开始 |
 | **M4** | 真质量闸门 | `npm test` 真跑、`git diff` 真喂给 review、commitlint 真校验，替换 LLM 自评 | 是 | 待开始 |
