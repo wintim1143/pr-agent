@@ -53,7 +53,7 @@ export function missingClaudeKey(): boolean {
  * 理由:误拒会让流水线明显报错(可观测),误放行则是静默绕过(不可观测)。
  */
 export function makeGuardHook(repoRoot: string): HookCallback {
-  return async (input) => {
+  return async input => {
     const deny = (reason: string): SyncHookJSONOutput => ({
       // 新版判定字段(SDK 推荐)
       hookSpecificOutput: {

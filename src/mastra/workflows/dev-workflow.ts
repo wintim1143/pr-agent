@@ -13,7 +13,8 @@ import { getGithubConfig, githubCheckout, githubPushAndOpenPR, githubMergePR, gi
  * - merge 是人工关卡:用 execute 里的 `suspend()` 挂起,等用户在飞书卡片点"合并"后
  *   `resume({ approved: true })` 再真正执行合并。
  * - checkout / push-open-pr 已接入 GitHub adapter(见 `../adapters/github`):
- *   checkout 用本地 git 建分支,push-open-pr 用 `git push`(token 内嵌 HTTPS)+ `gh pr create` 开 PR。
+ *   checkout 用本地 git 建分支,push-open-pr 用 `git push`(token 内嵌 HTTPS)+ REST `POST /pulls` 开 PR。
+ *   全链路不依赖 `gh` CLI(见 K5 决策)。
  *   未配置 GitHub(`GITHUB_TOKEN` 缺失)时这两步跳过、不阻断流程;notify 步已接入飞书 adapter,
  *   未配置飞书时跳过、推送失败仅告警,不阻断后续合并关卡。
  *
@@ -198,7 +199,7 @@ const commit = createStep({
   },
 });
 
-// 6. push + open PR(已接入 GitHub adapter:git push + gh pr create)
+// 6. push + open PR(已接入 GitHub adapter:git push + REST POST /repos/{o}/{r}/pulls)
 const pushOpenPr = createStep({
   id: 'push-open-pr',
   description: 'push feature 分支并开 PR',

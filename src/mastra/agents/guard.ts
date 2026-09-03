@@ -52,7 +52,7 @@ export const PROTECTED_PATHS: readonly ProtectedPathRule[] = [
   { path: 'src/mastra/agents', match: 'exact' },
 ];
 /** 兼容旧签名：仅返回受保护路径字符串（供测试/日志快速引用）。 */
-export const PROTECTED_PATH_STRINGS: readonly string[] = PROTECTED_PATHS.map((p) => p.path);
+export const PROTECTED_PATH_STRINGS: readonly string[] = PROTECTED_PATHS.map(p => p.path);
 
 /** 会写入文件的工具，及其入参里承载路径的字段名。 */
 const WRITE_TOOLS: Readonly<Record<string, readonly string[]>> = {
@@ -92,9 +92,7 @@ const DANGEROUS_COMMANDS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
 /** shell 里「把内容写进文件」的写法 —— 命中后需再检查目标是否受保护。 */
 const REDIRECT_WRITE = /(?:(?:^|[;&|]\s*)[\w./-]+\s*)?(?:>>?|tee(?:\s+-a)?)\s*([^\s;|&>]+)/g;
 
-export type GuardDecision =
-  | { decision: 'allow' }
-  | { decision: 'deny'; reason: string };
+export type GuardDecision = { decision: 'allow' } | { decision: 'deny'; reason: string };
 
 /**
  * 把工具入参里的路径归一化成「相对仓库根、POSIX 分隔符」的形态。
@@ -118,9 +116,7 @@ export function isProtectedPath(relPath: string | null): boolean {
   if (!relPath) return false;
   return PROTECTED_PATHS.some(({ path: p, match }) => {
     if (relPath === p) return true;
-    return match === 'exact'
-      ? relPath.startsWith(p + '/')
-      : relPath.startsWith(p + '.');
+    return match === 'exact' ? relPath.startsWith(p + '/') : relPath.startsWith(p + '.');
   });
 }
 
@@ -145,11 +141,7 @@ function findRedirectTargetInProtected(command: string, repoRoot: string): strin
  * @param input    该工具调用的入参（`PreToolUseHookInput.tool_input`）
  * @param repoRoot 目标仓库根绝对路径，用于把路径归一化
  */
-export function guardToolCall(
-  toolName: string,
-  input: Record<string, unknown>,
-  repoRoot: string,
-): GuardDecision {
+export function guardToolCall(toolName: string, input: Record<string, unknown>, repoRoot: string): GuardDecision {
   // 1) 写文件类工具：检查目标路径
   const pathFields = WRITE_TOOLS[toolName];
   if (pathFields) {

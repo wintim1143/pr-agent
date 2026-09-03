@@ -14,6 +14,8 @@
  * 所有校验/报错都延迟到调用 `githubCheckout` / `githubPushAndOpenPR` / `githubMergePR` 时才暴露。
  */
 import { execFileSync } from 'node:child_process';
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 /** 统一 REST 调用:失败(<2xx)抛 `GithubApiError`(含 status + 响应体),供调用方判读。 */
 async function githubRequest<T>(
@@ -34,9 +36,7 @@ async function githubRequest<T>(
   const raw = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
   if (!resp.ok) {
     const msg = (raw && (raw.message || raw.errors)) || `HTTP ${resp.status}`;
-    throw new Error(
-      `GitHub API ${init?.method ?? 'GET'} ${path} → ${resp.status}: ${JSON.stringify(msg)}`
-    );
+    throw new Error(`GitHub API ${init?.method ?? 'GET'} ${path} → ${resp.status}: ${JSON.stringify(msg)}`);
   }
   return raw as T;
 }
@@ -144,6 +144,122 @@ function branchExists(root: string, branch: string): boolean {
   }
 }
 
+/** 实际 git 目录(worktree 场景下是 `.git/worktrees/<name>` 而非 `.git`)。`--git-dir` 返回相对 cwd 的路径,需 join。 */
+function gitDir(root: string): string {
+  const dir = execFileSync('git', ['rev-parse', '--git-dir'], {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim();
+  return join(root, dir);
+}
+
+/** 当前分支名;HEAD 处于 detached 时返回 null */
+function currentBranch(root: string): string | null {
+  try {
+    return execFileSync('git', ['symbolic-ref', '--short', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 确保 `refs/heads/<当前分支>` 的 ref 文件**真的落盘**。
+ *
+ * ## 为什么需要这一层
+ *
+ * 本环境(PortableGit + 沙箱)存在间歇性缺陷:**部分写 ref 的 git 操作会假成功** ——
+ * exit 0、输出正常,但 `.git/refs/heads/<branch>` 没被写入。已实测到的两种:
+ *
+ * 1. `git checkout -b <branch> <base>`(2026-09-03 踩中):写了 `.git/HEAD` 却没写 ref,
+ *    仓库进入 unborn 状态;后续 `git add -A && git commit` 把**整个工作树**当成新文件
+ *    提交成孤儿 commit(实测 66 files / 23647 insertions),历史全丢。
+ * 2. `git commit`:偶发不更新 ref 文件。
+ *
+ * 拆解后经实测可靠的命令:
+ * - `git checkout <branch>`      —— 切到**已存在**的 ref ✅(只写 HEAD,不动 ref)
+ * - 直接写 ref 文件 ✅(但**必须先 mkdir 父目录**:分支名含斜杠时 ref 路径是
+ *   `refs/heads/<dir>/<name>`,PortableGit 的 `git branch`/`git update-ref` 在创建含斜杠分支时
+ *   会假成功——退出 0 却连 `refs/heads/<dir>/` 目录都没建,导致后续 `git commit` 把整棵工作树
+ *   当新文件提交成孤儿 commit。所以建分支一律走 `createBranchVerified` 的 fs 兜底。)
+ *
+ * ## 为什么先校验再写,而不是无条件写
+ *
+ * 无条件覆盖有风险(detached HEAD / 并发提交)。所以先比对 `git rev-parse HEAD`,
+ * 只有不一致时才补写;写完再校验一次,仍不通过则抛错 ——
+ * **宁可显式失败,也不要静默把提交丢进孤儿对象**。
+ */
+function ensureRefFlushed(root: string, expectedSha: string): void {
+  const readHead = (): string | null => {
+    try {
+      return execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+    } catch {
+      return null;
+    }
+  };
+
+  if (readHead() === expectedSha) return;
+
+  const branch = currentBranch(root);
+  if (!branch) {
+    throw new Error(`ref 未落盘且 HEAD 处于 detached 状态,无法自动修复(期望 ${expectedSha})`);
+  }
+  const refPath = join(gitDir(root), 'refs', 'heads', branch);
+  // 分支名可能含斜杠(如 feat/123-xxx)→ ref 落盘路径需先在 refs/heads/ 下建子目录。
+  // 本环境 PortableGit 对"含斜杠分支的 ref 写入"会假成功(目录未建却 exit 0),故这里显式 mkdir 兜底。
+  mkdirSync(dirname(refPath), { recursive: true });
+  writeFileSync(refPath, `${expectedSha}\n`);
+
+  if (readHead() !== expectedSha) {
+    const actual = existsSync(refPath) ? readFileSync(refPath, 'utf8').trim() : '<文件不存在>';
+    throw new Error(
+      `ref 落盘校验失败:已写 ${refPath} = ${expectedSha},但 git 读到 ${actual}。` +
+        '这是本环境已知的 PortableGit ref-not-flushed 缺陷,需人工介入。'
+    );
+  }
+}
+
+/**
+ * 创建分支并校验 ref 落盘。
+ *
+ * **不能用 `git checkout -b <branch> <base>`** —— 见 `ensureRefFlushed` 的说明,
+ * 它在本环境会假成功并让仓库进入 unborn 状态。拆成 `git branch` + `git checkout` 两步。
+ */
+function createBranchVerified(root: string, branch: string, base: string): void {
+  execFileSync('git', ['branch', branch, base], { cwd: root, stdio: 'pipe' });
+  if (!branchExists(root, branch)) {
+    // 兜底:直接写 ref 文件(本环境实测可靠的落盘手段)。
+    // 注意:分支名含斜杠(如 feat/123-xxx)时,ref 路径需先在 refs/heads/ 下建子目录,
+    // 否则 writeFileSync 会因目录不存在而 ENOENT。PortableGit 的 git branch/update-ref
+    // 对此会假成功(目录未建却 exit 0),故这里显式 mkdir 兜底。
+    const sha = execFileSync('git', ['rev-parse', base], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    const refPath = join(gitDir(root), 'refs', 'heads', branch);
+    mkdirSync(dirname(refPath), { recursive: true });
+    writeFileSync(refPath, `${sha}\n`);
+  }
+  if (!branchExists(root, branch)) {
+    throw new Error(`创建分支 ${branch} 失败:ref 未落盘(PortableGit ref-not-flushed 缺陷)`);
+  }
+}
+
+/** 从 `git commit` 输出中提取新提交 SHA,如 `[main abc1234] feat: x` / `[b (root-commit) abc1234] x` */
+function parseCommitSha(output: string): string | null {
+  const m = output.match(/\[[^\]]*?([0-9a-f]{7,40})\]/);
+  return m ? m[1] : null;
+}
+
 /** 计算 branch 领先 base 的提交数 */
 function countAhead(root: string, base: string, branch: string): number {
   try {
@@ -172,7 +288,21 @@ export function gitCommit(
 } {
   try {
     execFileSync('git', ['add', '-A'], { cwd: root, stdio: 'pipe' });
-    execFileSync('git', ['commit', '-m', message], { cwd: root, stdio: 'pipe' });
+    const out = execFileSync('git', ['commit', '-m', message], {
+      cwd: root,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    // commit 在本环境同样可能假成功(exit 0 但 ref 未更新)→ 显式校验并兜底补写
+    const shortSha = parseCommitSha(out);
+    if (shortSha) {
+      const full = execFileSync('git', ['rev-parse', shortSha], {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+      ensureRefFlushed(root, full);
+    }
     return { committed: true };
   } catch (e) {
     const msg =
@@ -192,11 +322,14 @@ export async function githubCheckout(issueNumber: number, issueTitle: string): P
   const root = repoRoot();
   const branch = `feat/${issueNumber}-${slug(issueTitle)}`;
   const base = getGithubConfig()?.baseBranch || 'main';
-  if (branchExists(root, branch)) {
-    execFileSync('git', ['checkout', branch], { cwd: root, stdio: 'pipe' });
-  } else {
-    execFileSync('git', ['checkout', '-b', branch, base], { cwd: root, stdio: 'pipe' });
+  // 红线:绝不允许在 base 分支上直接开发。同名说明 issue 标题 slug 退化成了 base 名。
+  if (branch === base) {
+    throw new Error(`拒绝 checkout:目标分支 ${branch} 与 base 分支 ${base} 同名(不得在 base 分支上直接开发)`);
   }
+  if (!branchExists(root, branch)) {
+    createBranchVerified(root, branch, base);
+  }
+  execFileSync('git', ['checkout', branch], { cwd: root, stdio: 'pipe' });
   return branch;
 }
 
@@ -322,7 +455,12 @@ export async function githubMergePR(
     });
     return res;
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`合并 PR #${prNumber} 失败: ${msg}`);
+    // 保留 cause:原始异常里带 GitHub 的状态码与响应体(如 405「PR 不可合并」、409 冲突),
+    // 只保留 message 会让上层无法判断失败类型,排查时只能看到一句拼装后的中文。
+    // 注意:项目 target 是 ES2021,`new Error(msg, { cause })` 的第二个参数是 ES2022 才有的,
+    // 直接写会 TS2554,所以手动挂载 —— eslint 的 preserve-caught-error 认这种写法。
+    const wrapped = new Error(`合并 PR #${prNumber} 失败: ${e instanceof Error ? e.message : String(e)}`);
+    (wrapped as Error & { cause?: unknown }).cause = e;
+    throw wrapped;
   }
 }
