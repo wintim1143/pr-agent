@@ -113,15 +113,17 @@ const IssuesListSchema = z.object({
 
 const listIssuesTool = createTool({
   id: 'github-list-issues',
-  description: '列出当前仓库的 issue(只读 GET /repos/{owner}/{repo}/issues)。可选按状态过滤。注意:该端点也返回 PR,本工具已过滤掉 PR。',
+  description:
+    '列出当前仓库的 issue(只读 GET /repos/{owner}/{repo}/issues)。可选按状态过滤。注意:该端点也返回 PR,本工具已过滤掉 PR。',
   inputSchema: z.object({
     state: z.enum(['open', 'closed', 'all']).optional().describe('issue 状态过滤,默认 open'),
     perPage: z.number().int().min(1).max(100).optional().describe('每页条数,默认 10'),
   }),
   outputSchema: IssuesListSchema,
-  execute: async (inputData) => {
+  execute: async inputData => {
     const client = getGithubReadonlyClient();
-    if (!client) throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN(需 Contents 读权限)或无法从 git remote 解析 owner/repo');
+    if (!client)
+      throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN(需 Contents 读权限)或无法从 git remote 解析 owner/repo');
     const issues = await client.listIssues({ state: inputData.state, perPage: inputData.perPage });
     return { count: issues.length, issues };
   },
@@ -142,7 +144,7 @@ const getIssueTool = createTool({
     issueNumber: z.number().int().positive().describe('issue 编号'),
   }),
   outputSchema: IssueDetailSchema,
-  execute: async (inputData) => {
+  execute: async inputData => {
     const client = getGithubReadonlyClient();
     if (!client) throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN 或无法解析 owner/repo');
     return client.getIssue(inputData.issueNumber);
@@ -168,7 +170,7 @@ const listCommitsTool = createTool({
     perPage: z.number().int().min(1).max(100).optional().describe('每页条数,默认 10'),
   }),
   outputSchema: CommitsListSchema,
-  execute: async (inputData) => {
+  execute: async inputData => {
     const client = getGithubReadonlyClient();
     if (!client) throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN 或无法解析 owner/repo');
     const commits = await client.listCommits({ perPage: inputData.perPage });
@@ -188,9 +190,7 @@ export class GithubReadonlyIntegration extends Integration<void, GithubReadonlyC
   getApiClient(): Promise<GithubReadonlyClient> {
     const client = getGithubReadonlyClient();
     if (!client) {
-      return Promise.reject(
-        new Error('GitHub 未配置:缺少 GITHUB_TOKEN 或无法从 git remote 解析 owner/repo')
-      );
+      return Promise.reject(new Error('GitHub 未配置:缺少 GITHUB_TOKEN 或无法从 git remote 解析 owner/repo'));
     }
     return Promise.resolve(client);
   }

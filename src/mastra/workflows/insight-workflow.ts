@@ -29,12 +29,8 @@ const InsightSchema = z.object({
 
 const InsightContextSchema = z.object({
   query: z.string(),
-  issues: z
-    .array(z.object({ number: z.number(), title: z.string(), state: z.string(), url: z.string() }))
-    .optional(),
-  commits: z
-    .array(z.object({ sha: z.string(), message: z.string(), author: z.string(), date: z.string() }))
-    .optional(),
+  issues: z.array(z.object({ number: z.number(), title: z.string(), state: z.string(), url: z.string() })).optional(),
+  commits: z.array(z.object({ sha: z.string(), message: z.string(), author: z.string(), date: z.string() })).optional(),
   insight: z
     .object({ highlights: z.array(z.string()), risks: z.array(z.string()), suggestions: z.array(z.string()) })
     .optional(),
@@ -128,7 +124,8 @@ const collect = createStep({
 // LLM 调用经 generateInsight 包裹:有界超时 + 重试 + 降级(见上方说明)。
 const summarize = createStep({
   id: 'summarize',
-  description: '用 insight-agent 汇总洞察(plain generate + 解析 JSON,带超时/重试/降级,兼容不支持 structured output 的中继)',
+  description:
+    '用 insight-agent 汇总洞察(plain generate + 解析 JSON,带超时/重试/降级,兼容不支持 structured output 的中继)',
   inputSchema: InsightContextSchema,
   outputSchema: InsightContextSchema,
   execute: async ({ mastra, inputData }) => {

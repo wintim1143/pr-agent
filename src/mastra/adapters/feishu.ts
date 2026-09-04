@@ -245,10 +245,7 @@ export interface FeishuInboundMessage {
   createTime: number;
 }
 
-export async function feishuListMessages(
-  chatId: string,
-  sinceTs: number
-): Promise<FeishuInboundMessage[]> {
+export async function feishuListMessages(chatId: string, sinceTs: number): Promise<FeishuInboundMessage[]> {
   const cfg = getFeishuConfig();
   if (!cfg || cfg.mode !== 'app') {
     throw new Error(
@@ -256,10 +253,9 @@ export async function feishuListMessages(
     );
   }
   const token = await getTenantAccessToken(cfg.appId as string, cfg.appSecret as string);
-  const url =
-    `${FEISHU_DOMAIN}/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(
-      chatId
-    )}&start_time=${sinceTs}&sort_type=ByCreateTimeAsc`;
+  const url = `${FEISHU_DOMAIN}/im/v1/messages?container_id_type=chat&container_id=${encodeURIComponent(
+    chatId
+  )}&start_time=${sinceTs}&sort_type=ByCreateTimeAsc`;
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
   const j = (await resp.json().catch(() => null)) as { code?: number; msg?: string; data?: { items?: any[] } } | null;
   if (j?.code !== 0) {
