@@ -1,20 +1,24 @@
 /**
- * M1-6 端到端验证:直接驱动 insight-workflow,核对 AC-1~AC-5(AC-6 零写入由设计保证,另查 git status)。
+ * M1-6 端到端验证:直接驱动 insight-workflow,核对 AC-1~AC-7。
  *
  * 复用已 build 的产物(dist/mastra/index.js 的 mastra 单例),不依赖起 Midway HTTP 服务。
  * 流程:createRun → start(跑到 confirm 步 suspend)→ 检查 suspended + 数据真实 → resume({approved:true})→ 检查终态 + 上下文未丢。
  *
- * 关键改进(相对初版):
+ * 关键特性:
  * - 日志同时写 `logs/m1-verify.log`(带时间戳),避免 `| tail` 管道缓冲在 SIGTERM 时丢失输出。
  * - start()/resume() 包一层内部守卫超时(Promise.race),即便某步挂起也能打印诊断而非静默被杀。
  * - 单独先跑一次 GitHub client 预检,把 collect 路径与 workflow 解耦定位。
+ * - 人工验收支持:设 M1_MANUAL_CONFIRM=1 时,resume 前暂停等待,把真实经历留给人工查看/确认。
  *
  * 运行: node scripts/verify-insight-loop.js
+ * 人工模式: M1_MANUAL_CONFIRM=1 node scripts/verify-insight-loop.js
+ * 快速模式(LLM 秒级降级): M1_LLM_TIMEOUT_MS=6000 M1_LLM_ATTEMPTS=1 node scripts/verify-insight-loop.js
  */
 'use strict';
 require('dotenv').config();
 const path = require('node:path');
 const fs = require('node:fs');
+const readline = require('node:readline');
 
 const LOG = path.resolve(__dirname, '../logs/m1-verify.log');
 const lines = [];
@@ -34,6 +38,23 @@ function withGuard(promise, ms, label) {
   return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
+/** 人工验收:等用户在终端确认后再继续(用于 M1_MANUAL_CONFIRM=1 模式)。 */
+function waitForUser(label) {
+  return new Promise(resolve => {
+    if (process.env.M1_MANUAL_CONFIRM !== '1') return resolve();
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`\n[人工验收] ${label}\n输入 y 继续,其他终止: `, ans => {
+      rl.close();
+      if (ans.trim().toLowerCase() !== 'y') {
+        log('✗ 人工验收未确认,终止验证');
+        process.exit(1);
+      }
+      log(`[人工验收] ${label} → 已确认 y`);
+      resolve();
+    });
+  });
+}
+
 (async () => {
   const t0 = Date.now();
   log('== M1-6 端到端验证开始 ==');
@@ -45,7 +66,6 @@ function withGuard(promise, ms, label) {
     log('[预检] getGithubReadonlyClient() = NULL(GitHub 未配置),collect 将返回空,AC-2 不达标');
   } else {
     const [is, cs] = await Promise.all([client.listIssues({ state: 'all', perPage: 10 }), client.listCommits({ perPage: 10 })]);
-
     log(`[预检] GitHub OK: issues=${is.length}, commits=${cs.length}`);
   }
 
@@ -53,6 +73,7 @@ function withGuard(promise, ms, label) {
   const wf = mastra.getWorkflow('insight-workflow');
   const run = await wf.createRun();
   log('→ runId =', run.runId);
+  log('AC-1 runId 生成 ✓');
 
   log('→ start() 跑到 suspend(内部守卫 180s)...');
   const result = await withGuard(run.start({ inputData: { query: '最近项目有哪些进展和潜在风险?' } }), 180_000, 'start');
@@ -84,6 +105,9 @@ function withGuard(promise, ms, label) {
     process.exit(1);
   }
   log('✓ AC-4 run 已 suspend(停在 confirm 步)');
+
+  // 人工验收点:到此,飞书群应已收到卡片(若有飞书配置)。若人工模式,让用户去群里确认。
+  await waitForUser('AC-3 飞书卡片是否已发到群?(Y/N)');
 
   log('→ resume({ approved: true })...');
   const r2 = await withGuard(run.resume({ resumeData: { approved: true } }), 60_000, 'resume');

@@ -31,7 +31,7 @@
 
 | 里程碑 | 名称 | 端到端演示的效果 | 是否写目标仓库 | 状态 |
 |---|---|---|---|---|
-| **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ 已完成（AC-3 洞察内容受中继不稳定影响暂降级） |
+| **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ 已完成（AC-1~AC-7 全量复验通过，**待人工验收**） |
 | **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | 待开始 |
 | **M3** | 完整 PR 闭环 | push + 开 PR + 飞书卡片确认 → squash merge | 是 | 待开始 |
 | **M4** | 真质量闸门 | `npm test` 真跑、`git diff` 真喂给 review、commitlint 真校验，替换 LLM 自评 | 是 | 待开始 |
@@ -56,9 +56,9 @@
 
 每个里程碑都是「薄切片」，但切片之间不是孤立的——前一个跑通后沉淀的可复用基建，直接变成后一个的起跑线。下表把这条递进链显式写出来（M2–M6 卡未建，解锁关系先按路线图标预期；建卡后在各自 §解锁与复用 回填实际复用）。
 
-| 里程碑 | 沉淀的可复用基建 | 解锁的下一里程碑能力 |
-|---|---|---|
-| **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 |
+| 里程碑 | 沉淀的可复用基建 | 解锁的下一里程碑能力 | 前置输入/外部依赖 |
+|---|---|---|---|
+| **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 | GitHub/飞书配置 + 中继可用 |
 | **M2 本地写入** | 编码 agent 真改文件 + 真 commit 的端到端（本地）、guard 权限围栏在写场景的验证 | **M3**：在 M2 基础上加 push + 开 PR + squash merge |
 | **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库选型在此落定** | **M4**：在真实 PR 上挂真质量闸门 |
 | **M4 真闸门** | `npm test` 真跑 / `git diff` 真喂 review / commitlint 真校验（替换 LLM 自评） | **M5**：把闸门扩展到多仓库 + GitHub App 鉴权 |
@@ -77,6 +77,7 @@
 5. **完成后立刻归档**：改了什么、重点模块、踩坑，写进实施日志，不等到里程碑收尾。
 6. **每个里程碑配一张数据流向图（流程图 / 时序图）**，展示「触发 → 编排 → 集成 → 外部系统」及 suspend/resume 断点。推荐用 Mermaid 写在独立文件 `M<n>-<名称>-flow.md`，卡片只放链接。
 7. **记录不强制单文件**：里程碑卡可只做索引，链路图 / 流程图 / 实施日志 / 复盘等拆到同目录的独立文件（或子目录），便于单篇查看与演进。
+8. **失败路径显式声明**：每个里程碑在卡的「异常与兜底」节列出「已知异常 → 判定条件 → 降级行为 → 是否阻断 AC」，判定条件必须可执行（返回码 / 超时秒数 / 配置缺失），不许写无法判定的表述。M1 的教训：外部依赖（LLM 中继）挂起曾冻结整条 suspend/resume 闭环，靠「超时+重试+降级」才解掉。
 
 ---
 
