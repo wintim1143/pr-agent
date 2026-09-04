@@ -132,7 +132,10 @@ skill 与 workflow 步的对应：
   1. `permissionMode: 'bypassPermissions'` + `allowDangerouslySkipPermissions`（无人值守，否则 Bash 缺 TTY 卡死）
   2. `allowedTools` / `disallowedTools`（bypass 下不具约束力，防御纵深；断掉 WebFetch/WebSearch）
   3. **PreToolUse hook → `guard.ts`**（与 permissionMode 无关）
-- `sdkOptions.env` 一旦设置会**整个替换**子进程环境，必须 `...process.env` 再覆盖 `ANTHROPIC_*`。
+- **凭据默认不注入**：`sdkOptions.env` 由 `buildCodingEnv()` 生成，**默认原样继承 `process.env`、不覆盖 `ANTHROPIC_*`**，让 Claude Code CLI 自行读取 `~/.claude/settings.json`（本机是 cc-switch 代理 `127.0.0.1:15721`）。需换后端时设 `CODING_ANTHROPIC_BASE_URL` / `_API_KEY` / `_AUTH_TOKEN` / `_MODEL`。
+  - ⚠️ **不要改回硬注入 `LLM_BASE_URL`**。官方 settings 文档明确「真实进程环境变量优先于 settings.json 的 `env` 块」，注入会把用户配好的代理端点盖掉——2026-09-04 的 M2 编码超时就是这么来的。
+  - ⚠️ `sdkOptions.env` 一旦设置会**整个替换**子进程环境，`buildCodingEnv()` 里必须展开 `...process.env`，否则子进程缺 PATH/HOME 直接炸。
+- 凭据探测是 `missingCodingCredentials()`（**不是**看父进程 `ANTHROPIC_API_KEY`）：进程 env 的 key → `CODING_ANTHROPIC_*` → `~/.claude/settings.json` 的 `env` 块，任一命中即认为可用。只看父进程会恒为「缺失」，因为正常路径下凭据根本不在父进程里。
 - `maxTurns` / `maxBudgetUsd` 是成本上限，env 可覆盖。
 
 ### 3.4 `guard.ts` 关键点
@@ -233,7 +236,7 @@ Resume：`POST /api/workflows/insight-workflow/resume?runId=` body `{ "resumeDat
 | # | step | 调谁 | 备注 |
 |---|---|---|---|
 | 1 | `checkout` | `githubCheckout(issueNumber, title)` | 失败降级占位分支名，不抛 |
-| 2 | `coding` | **动态 import** `getCodingAgent()` | 缺 Anthropic key → 占位字符串 |
+| 2 | `coding` | **动态 import** `getCodingAgent()` | 缺凭据 → `SKIPPED_NO_CREDENTIALS`；执行异常 → `ERROR: ...`（两者都 `console.error`，不静默） |
 | 3 | `test` | `runGate(dev-agent, code-testing, TestGateSchema)` | TODO：`passed=false` 打回 coding（条件边未做） |
 | 4 | `review` | `runGate(..., code-review, ReviewGateSchema)` | TODO：`request-changes` 打回 |
 | 5 | `commit` | `runGate(..., commit-message)` + `gitCommit()` | 闸门出 message，adapter 真正提交 |

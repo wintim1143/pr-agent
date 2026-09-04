@@ -113,10 +113,18 @@ const coding = createStep({
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
     // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
-    const { getCodingAgent, missingClaudeKey, getRepoRoot } = await import('../agents/coding-agent.js');
-    if (missingClaudeKey()) {
-      console.warn('[coding] 未配置 ANTHROPIC_API_KEY / CLAUDE_API_KEY,跳过真实编码(codingResult 仅占位)');
-      return { ...inputData, codingResult: '(skipped: missing ANTHROPIC_API_KEY)' };
+    const { getCodingAgent, missingCodingCredentials, getRepoRoot } = await import('../agents/coding-agent.js');
+    if (missingCodingCredentials()) {
+      // 用 error 而非 warn:走到这里意味着「编码这个核心能力根本没执行」,静默降级会让
+      // 后续 test/review/commit 全部基于空结果跑完,表面上全绿实则什么都没做。
+      // 凭据判定逻辑与历史坑见 coding-agent.ts 的 missingCodingCredentials 注释。
+      console.error(
+        '[coding] 未发现任何编码后端凭据,跳过真实编码。已检查:进程 env 的 ANTHROPIC_API_KEY/CLAUDE_API_KEY、' +
+          'CODING_ANTHROPIC_*、以及 ~/.claude/settings.json 的 env 块。' +
+          '若本机 Claude Code 可正常使用,请确认 ~/.claude/settings.json 里存在 env.ANTHROPIC_BASE_URL;' +
+          '否则显式设置 CODING_ANTHROPIC_BASE_URL / CODING_ANTHROPIC_API_KEY。'
+      );
+      return { ...inputData, codingResult: '(SKIPPED_NO_CREDENTIALS: 编码未执行)' };
     }
     try {
       const agent = await getCodingAgent(getRepoRoot());
@@ -134,8 +142,9 @@ const coding = createStep({
       ]);
       return { ...inputData, codingResult: res.text ?? '(no output)' };
     } catch (e) {
-      console.warn('[coding] ClaudeSDKAgent 执行异常:', e instanceof Error ? e.message : e);
-      return { ...inputData, codingResult: `(error: ${e instanceof Error ? e.message : e})` };
+      // 同样用 error:编码失败后 test/review/commit 全部失去意义,不能静默混过。
+      console.error('[coding] ClaudeSDKAgent 执行异常:', e instanceof Error ? e.message : e);
+      return { ...inputData, codingResult: `(ERROR: ${e instanceof Error ? e.message : e})` };
     }
   },
 });

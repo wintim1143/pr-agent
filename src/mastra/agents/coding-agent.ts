@@ -1,4 +1,7 @@
 import { execSync } from 'child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { ClaudeSDKAgent } from '@mastra/claude';
 import type { HookCallback, SyncHookJSONOutput } from '@anthropic-ai/claude-agent-sdk';
 import { guardToolCall } from './guard.js';
@@ -35,11 +38,80 @@ export function getRepoRoot(): string {
 
 /**
  * 是否缺少 Claude 编码所需的凭证。
- * Claude Code CLI 优先读 `ANTHROPIC_API_KEY`,也认 `CLAUDE_API_KEY`(部分封装层)。
- * 缺失时不应让 workflow 崩溃,应降级跳过(由调用方决定后续行为)。
+ *
+ * ## 历史坑(2026-09-04 修复)
+ *
+ * 旧实现只有一行:`!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_API_KEY`。
+ * 但**正常路径下父进程本来就没有这个变量** —— 凭据来自 Claude Code CLI 启动时自行读取的
+ * `~/.claude/settings.json`(本机是 cc-switch 代理:`ANTHROPIC_BASE_URL=http://127.0.0.1:15721`
+ * + `ANTHROPIC_AUTH_TOKEN`,代理再注入真 key;本机 `~/.claude.json` 与 `.credentials.json`
+ * 均**无** Claude 账号 OAuth 登录态)。
+ *
+ * 于是该判断恒为 `true`,coding 步永远走占位降级分支,只打一行 warn —— M2 因此
+ * 一直跑不出真实改动,且从结果上无法区分「agent 没跑」和「跑了但没改东西」。
+ *
+ * ## 优先级事实(官方 `code.claude.com/docs/en/settings`)
+ *
+ * > Environment variables aren't a level in this stack... `ANTHROPIC_MODEL` exported in your
+ * > shell applies over the `model` key from any file.
+ *
+ * 即**真实进程环境变量优先于 settings.json 的 env 块**。这也解释了为什么往子进程注入
+ * `ANTHROPIC_*` 会盖掉用户配好的代理端点(见 `buildCodingEnv`)。
+ *
+ * ## 现在的判定(命中任一即视为可用)
+ *
+ * 1. 进程环境里有显式 key:`ANTHROPIC_API_KEY` / `CLAUDE_API_KEY`
+ * 2. 用户显式覆盖编码后端:`CODING_ANTHROPIC_API_KEY` / `CODING_ANTHROPIC_BASE_URL`
+ * 3. `~/.claude/settings.json` 的 `env` 块提供了端点或凭据(CLI 启动时自己应用)
+ *
+ * ⚠️ 这是**启发式**判断 —— 真正的可用性只有 CLI 跑起来才知道。因此调用方在编码失败时
+ * 必须**显式报错**,不能静默降级成占位符。
  */
-export function missingClaudeKey(): boolean {
-  return !process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_API_KEY;
+export function missingCodingCredentials(): boolean {
+  if (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) return false;
+  if (process.env.CODING_ANTHROPIC_API_KEY || process.env.CODING_ANTHROPIC_BASE_URL) return false;
+  return !hasClaudeSettingsCredential();
+}
+
+/** 从 `~/.claude/settings.json` 的 env 块里找端点/凭据信号。只读、任何异常都视为「没有」。 */
+function hasClaudeSettingsCredential(): boolean {
+  try {
+    const file = path.join(os.homedir(), '.claude', 'settings.json');
+    if (!fs.existsSync(file)) return false;
+    const env = JSON.parse(fs.readFileSync(file, 'utf8'))?.env ?? {};
+    return Boolean(env.ANTHROPIC_BASE_URL || env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 构造传给 Claude Code CLI 子进程的 env。
+ *
+ * ## 为什么默认【不覆盖】ANTHROPIC_*(2026-09-04 修复)
+ *
+ * 官方 `@mastra/claude` 示例根本不传 key —— 因为凭据该由 CLI 自己解析。本机链路:
+ * `~/.claude/settings.json` env 块 → `ANTHROPIC_BASE_URL=http://127.0.0.1:15721`(cc-switch 代理)
+ * → 代理注入真 key。旧实现把 `ANTHROPIC_BASE_URL` 硬改成 `LLM_BASE_URL`(lanfengai 直连),
+ * 直接盖掉了这条可用通路 —— 这是 M2 编码超时的根因之一。
+ *
+ * 现在:**默认原样继承父进程环境**,只有用户显式设置 `CODING_ANTHROPIC_*` 时才覆盖。
+ *
+ * ⚠️ `sdk.d.ts` 明确:env 一旦设置会**整个替换**子进程环境、不自动合并 `process.env`。
+ * 所以必须展开 `...process.env`,否则子进程会因缺 PATH/HOME 直接炸掉。
+ */
+function buildCodingEnv(): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env };
+  const override: Record<string, string | undefined> = {
+    ANTHROPIC_BASE_URL: process.env.CODING_ANTHROPIC_BASE_URL,
+    ANTHROPIC_API_KEY: process.env.CODING_ANTHROPIC_API_KEY,
+    ANTHROPIC_AUTH_TOKEN: process.env.CODING_ANTHROPIC_AUTH_TOKEN,
+    ANTHROPIC_MODEL: process.env.CODING_ANTHROPIC_MODEL,
+  };
+  for (const [key, value] of Object.entries(override)) {
+    if (value) env[key] = value;
+  }
+  return env;
 }
 
 /**
@@ -119,16 +191,11 @@ export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
     description: '使用 Claude Code CLI 在目标仓库真正读写文件,完成 issue 对应的编码',
     sdkOptions: {
       cwd: repoRoot,
-      // 注入编码后端端点(lanfengai 中转):编码 CLI 读 ANTHROPIC_* 系列 env。
-      // ⚠️ sdk.d.ts 明确:env 一旦设置会"整个替换"子进程环境、不自动合并 process.env,
-      // 因此必须展开 ...process.env 保留 PATH/HOME 等,否则子进程会因缺基础变量炸掉。
-      // 当前 .env 只有 LLM_*(lanfengai 中转),映射到 ANTHROPIC_* 供 CLI 复用。
-      env: {
-        ...process.env,
-        ANTHROPIC_BASE_URL: process.env.LLM_BASE_URL, // lanfengai.cn/v1(Anthropic Messages 协议挂载点)
-        ANTHROPIC_API_KEY: process.env.LLM_API_KEY,
-        ANTHROPIC_MODEL: process.env.LLM_MODEL || 'glm-5.3',
-      },
+      // 默认原样继承父进程环境,不覆盖 ANTHROPIC_* —— 让 Claude Code CLI 自行读取
+      // `~/.claude/settings.json` 里配好的代理端点(本机为 cc-switch 127.0.0.1:15721)。
+      // 需要显式换后端时,设置 CODING_ANTHROPIC_BASE_URL / _API_KEY / _AUTH_TOKEN / _MODEL。
+      // 细节与历史坑见 buildCodingEnv 的注释。
+      env: buildCodingEnv(),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       allowedTools: [
