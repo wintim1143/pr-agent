@@ -92,6 +92,23 @@ const DANGEROUS_COMMANDS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
 /** shell 里「把内容写进文件」的写法 —— 命中后需再检查目标是否受保护。 */
 const REDIRECT_WRITE = /(?:(?:^|[;&|]\s*)[\w./-]+\s*)?(?:>>?|tee(?:\s+-a)?)\s*([^\s;|&>]+)/g;
 
+/**
+ * 无人值守编码体禁用的工具(整工具级 deny,2026-09-07 新增)。
+ *
+ * - `Task` / `Agent`(新旧两版 CLI 对「派生子 agent」工具的命名):实测(2026-09-07,run
+ *   fa70e07b)编码模型会在完成主任务后**自作主张派子 agent 做自我审查** —— 嵌套会话
+ *   再走一遍慢速上游,直接把 CODING_TIMEOUT_MS(600s)烧完,整条流水线被守卫误杀。
+ *   子 agent 也脱离了本围栏的视野(PreToolUse hook 是否对孙级会话生效无契约保证),禁止最稳。
+ * - `WebFetch` / `WebSearch`:断网红线,与 coding-agent 的 disallowedTools 互为纵深
+ *   (bypassPermissions 下 disallowedTools 不保证生效,hook 是唯一可靠层)。
+ */
+const DENY_TOOLS: Readonly<Record<string, string>> = {
+  Task: '无人值守编码禁止派生子 agent(会绕过围栏视野且曾把编码超时预算烧完)',
+  Agent: '无人值守编码禁止派生子 agent(会绕过围栏视野且曾把编码超时预算烧完)',
+  WebFetch: '编码执行体禁止联网(防数据外泄)',
+  WebSearch: '编码执行体禁止联网(防数据外泄)',
+};
+
 export type GuardDecision = { decision: 'allow' } | { decision: 'deny'; reason: string };
 
 /**
@@ -142,6 +159,10 @@ function findRedirectTargetInProtected(command: string, repoRoot: string): strin
  * @param repoRoot 目标仓库根绝对路径，用于把路径归一化
  */
 export function guardToolCall(toolName: string, input: Record<string, unknown>, repoRoot: string): GuardDecision {
+  // 0) 整工具级禁用(子 agent / 联网):与入参无关,直接拒
+  const denyReason = DENY_TOOLS[toolName];
+  if (denyReason) return { decision: 'deny', reason: denyReason };
+
   // 1) 写文件类工具：检查目标路径
   const pathFields = WRITE_TOOLS[toolName];
   if (pathFields) {
@@ -175,6 +196,6 @@ export function guardToolCall(toolName: string, input: Record<string, unknown>, 
     return { decision: 'allow' };
   }
 
-  // 3) 其余工具（Read / Glob / Grep / TodoWrite 等）只读或无害，放行
+  // 3) 其余工具(Read / Glob / Grep / TodoWrite 等只读或无害工具)放行
   return { decision: 'allow' };
 }

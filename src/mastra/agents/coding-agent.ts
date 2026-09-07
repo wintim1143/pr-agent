@@ -121,6 +121,15 @@ function hasClaudeSettingsCredential(): boolean {
  *
  * ⚠️ `sdk.d.ts` 明确:env 一旦设置会**整个替换**子进程环境、不自动合并 `process.env`。
  * 所以必须展开 `...process.env`,否则子进程会因缺 PATH/HOME 直接炸掉。
+ *
+ * ## 为什么注入 `API_TIMEOUT_MS`(2026-09-07 新增)
+ *
+ * 实测(见 logs/m2-verify.log + ~/.claude/projects/D--code-pr-agent-sandbox/*.jsonl):
+ * 编码 CLI 在 Edit 成功后要再发一次收尾请求,该请求对 cc-switch 上游(gpt-5.6-terra)
+ * **无限挂起 4 分钟无响应** —— 代理日志在最后一次成功请求后再无新条目,CLI 也没有
+ * 任何请求级超时,只能等 workflow 的 CODING_TIMEOUT_MS(600s)整段杀掉。
+ * Claude Code CLI 支持 `API_TIMEOUT_MS`(单请求超时,毫秒);超时后 SDK 自动重试,
+ * 把「上游偶发挂死」从致命变成可恢复。可用 `CODING_API_TIMEOUT_MS` 覆盖,设 `0` 关闭注入。
  */
 function buildCodingEnv(): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
@@ -130,6 +139,8 @@ function buildCodingEnv(): Record<string, string | undefined> {
     ANTHROPIC_AUTH_TOKEN: process.env.CODING_ANTHROPIC_AUTH_TOKEN,
     ANTHROPIC_MODEL: process.env.CODING_ANTHROPIC_MODEL,
   };
+  const apiTimeoutMs = process.env.CODING_API_TIMEOUT_MS ?? '180000';
+  if (apiTimeoutMs !== '0') override.API_TIMEOUT_MS = apiTimeoutMs;
   for (const [key, value] of Object.entries(override)) {
     if (value) env[key] = value;
   }
@@ -232,8 +243,10 @@ export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
         'TaskUpdate',
         'TaskList',
       ],
-      // 断网:禁止联网工具,避免把仓库内容/凭据外发
-      disallowedTools: ['WebFetch', 'WebSearch'],
+      // 断网 + 禁子 agent:禁止联网工具(防数据外泄)、禁止派生子 agent(2026-09-07 实测
+      // 编码模型会自派子 agent 做自我审查,嵌套会话把 CODING_TIMEOUT_MS 烧完;guard.ts
+      // 的 DENY_TOOLS 是 bypass 模式下的可靠拦截层,此处为防御纵深)。
+      disallowedTools: ['WebFetch', 'WebSearch', 'Task', 'Agent'],
       hooks: {
         // 不设 matcher:按 SDK 官方示例,默认对全部工具生效
         PreToolUse: [{ hooks: [makeGuardHook(repoRoot)] }],

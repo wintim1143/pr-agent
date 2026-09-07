@@ -239,14 +239,16 @@ Resume：`POST /api/workflows/insight-workflow/resume?runId=` body `{ "resumeDat
 
 | # | step | 调谁 | 备注 |
 |---|---|---|---|
-| 1 | `checkout` | `githubCheckout(issueNumber, title)` | 失败降级占位分支名，不抛 |
-| 2 | `coding` | **动态 import** `getCodingAgent()` | 缺凭据 → `SKIPPED_NO_CREDENTIALS`；执行异常 → `ERROR: ...`（两者都 `console.error`，不静默） |
+| 1 | `checkout` | `githubCheckout(issueNumber, title)` | **失败直接抛**（2026-09-07 改）。原实现 catch 后返回占位分支名 `feat/<n>-dev` 并仅 warn，导致分支其实没建成、后续 coding/commit 落在原分支上，而「当前分支 = feat/…」看起来成立 —— 典型假绿。建分支失败没有安全降级路径 |
+| 2 | `coding` | **动态 import** `getCodingAgent()` | 缺凭据 → `SKIPPED_NO_CREDENTIALS`；执行异常 → `ERROR: ...`（两者都 `console.error`，不静默）。外部包 `withCodingGuard()` 超时守卫（`CODING_TIMEOUT_MS`，默认 600s）—— CLI 子进程可能永不返回，无守卫会冻住整条 workflow |
 | 3 | `test` | `runGate(dev-agent, code-testing, TestGateSchema)` | TODO：`passed=false` 打回 coding（条件边未做） |
 | 4 | `review` | `runGate(..., code-review, ReviewGateSchema)` | TODO：`request-changes` 打回 |
 | 5 | `commit` | `runGate(..., commit-message)` + `gitCommit()` | 闸门出 message，adapter 真正提交 |
-| 6 | `push-open-pr` | `githubPushAndOpenPR()` | 未配置 GitHub → `prNumber=0` |
-| 7 | `notify` | `buildDevCompleteCard` + `feishuNotify` | 按钮 `merge_<n>` / `reject_<n>`；失败仅告警 |
-| 8 | `merge` | 无 approved → suspend；有则 `githubMergePR` | `prNumber<=0` → `merge-skipped` |
+| 6 | `push-open-pr` | `githubPushAndOpenPR()` | `stopAfterCommit` → 直接 return `prNumber=0`；未配置 GitHub → 同 |
+| 7 | `notify` | `buildDevCompleteCard` + `feishuNotify` | `stopAfterCommit` → 不发（该卡片是「PR 待合并」语义，PR 号为 0 会误导）；失败仅告警 |
+| 8 | `merge` | 无 approved → suspend；有则 `githubMergePR` | `stopAfterCommit` → **在 suspend 之前** return，否则会停在一个 M2 下永远没人 approve 的挂起 |
+
+**`stopAfterCommit` 入参（2026-09-07 新增，默认 `false`）**：为真时末尾三步（push / notify / merge）不执行任何副作用，用于 M2「本地写入闭环」—— 不 push、不开 PR、不进合并关卡。默认 `false`，M3 不传该字段行为与改造前完全一致。
 
 `runGate`：`agent.generate(..., { structuredOutput: { schema, errorStrategy: 'strict' } })` 读 `res.object`。与 insight 的 plain generate 不同——闸门必须能被条件边判定，不能解析自由文本。
 
