@@ -45,7 +45,7 @@ function withGuard(promise, ms, label) {
   log('[env] LLM_BASE_URL  =', process.env.LLM_BASE_URL || '(空)');
   log('[env] LLM_MODEL     =', process.env.LLM_MODEL || '(空)');
   log('[env] LLM_API_KEY   =', process.env.LLM_API_KEY ? `已设置(len=${process.env.LLM_API_KEY.length})` : '(空)');
-  log('[env] 父进程 ANTHROPIC_API_KEY =', process.env.ANTHROPIC_API_KEY ? '已设置' : '(空 → dev-workflow 的 missingClaudeKey() 会返回 true)');
+  log('[env] 父进程 ANTHROPIC_API_KEY =', process.env.ANTHROPIC_API_KEY ? '已设置' : '(空 = 正常,凭据由 CLI 自读 settings.json)');
 
   // --- 一次性靶场 ---
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pr-agent-coding-probe-'));
@@ -68,7 +68,7 @@ function withGuard(promise, ms, label) {
 
   log('→ getCodingAgent(tmpDir) ...');
   const agent = await getCodingAgent(tmp);
-  log('✓ agent 构造完成(内部已把 LLM_* 映射为子进程 ANTHROPIC_*)');
+  log('✓ agent 构造完成(继承父进程 env;Claude CLI 自读 ~/.claude/settings.json 取端点)');
 
   const prompt =
     '这是一个连通性测试。请严格按两步做,不要做别的:\n' +

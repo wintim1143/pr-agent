@@ -27,8 +27,30 @@ import { guardToolCall } from './guard.js';
  *    (受保护路径 + 危险命令),且与 permissionMode 无关。
  */
 
-/** 解析 git 仓库根(自举场景 coding 改的就是当前仓库) */
+/**
+ * 解析目标仓库根目录(编码 agent 的 cwd)。
+ *
+ * ## 为什么需要 `CODING_REPO_ROOT`(2026-09-07)
+ * 原实现取「父进程 cwd 的 git 顶层」= 自举场景(改 pr-agent 自己)。但 M2 要在**隔离的沙箱
+ * 仓库**里写,否则编码 agent 会直接在 pr-agent 上建分支、改文件、commit —— 静默且危险。
+ *
+ * 现在:**显式配置优先**;未配置时保持原自举行为。
+ * 目录不存在 / 不是 git 仓库 → 显式抛错,而不是回退到 cwd 悄悄打错仓库。
+ *
+ * 与 `adapters/github.ts` 的 `repoRoot()` 读同一个 env,
+ * 保证 checkout / coding / commit 落在同一个仓库。
+ */
 export function getRepoRoot(): string {
+  const configured = process.env.CODING_REPO_ROOT?.trim();
+  if (configured) {
+    if (!fs.existsSync(configured)) {
+      throw new Error(`CODING_REPO_ROOT 指向的目录不存在: ${configured}`);
+    }
+    if (!fs.existsSync(path.join(configured, '.git'))) {
+      throw new Error(`CODING_REPO_ROOT 指向的不是 git 仓库(缺 .git): ${configured}`);
+    }
+    return configured;
+  }
   try {
     return execSync('git rev-parse --show-toplevel', { encoding: 'utf8' }).trim();
   } catch {

@@ -48,8 +48,31 @@ export interface GithubConfig {
   baseBranch: string;
 }
 
-/** 仓库根目录(git 工作树顶层) */
+/**
+ * 仓库根目录(git 工作树顶层)。
+ *
+ * ## 为什么需要 `CODING_REPO_ROOT`(2026-09-07)
+ * 原实现只取「父进程 cwd 的 git 顶层」:在 pr-agent 目录下跑 workflow 时,checkout/commit
+ * 会**静默打在 pr-agent 自己身上** —— 与「M2 在隔离沙箱仓库里写」的意图相反,且不看代码
+ * 根本发现不了打错了仓库。
+ *
+ * 现在:**显式配置优先**;未配置时回退原自举行为(不破坏既有调用方)。
+ * 目录不存在 / 不是 git 仓库 → 显式抛错,而不是悄悄回退到 cwd 打错地方。
+ *
+ * 与 `agents/coding-agent.ts` 的 `getRepoRoot()` 读同一个 env,
+ * 保证 checkout / coding / commit 落在同一个仓库。
+ */
 function repoRoot(): string {
+  const configured = process.env.CODING_REPO_ROOT?.trim();
+  if (configured) {
+    if (!existsSync(configured)) {
+      throw new Error(`CODING_REPO_ROOT 指向的目录不存在: ${configured}`);
+    }
+    if (!existsSync(join(configured, '.git'))) {
+      throw new Error(`CODING_REPO_ROOT 指向的不是 git 仓库(缺 .git): ${configured}`);
+    }
+    return configured;
+  }
   return execFileSync('git', ['rev-parse', '--show-toplevel'], {
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
