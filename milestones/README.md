@@ -32,7 +32,7 @@
 | 里程碑 | 名称 | 端到端演示的效果 | 是否写目标仓库 | 状态 |
 |---|---|---|---|---|
 | **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ **已完成**（AC-1~AC-7 全量复验通过 + 人工验收通过） |
-| **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | 待开始 |
+| **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | 🔄 **进行中**（M2-1/M2-2 已完成，M2-3 编排改造未开始）—— 卡：[`M2-本地写入闭环.md`](./M2-本地写入闭环.md) |
 | **M3** | 完整 PR 闭环 | push + 开 PR + 飞书卡片确认 → squash merge | 是 | 待开始 |
 | **M4** | 真质量闸门 | `npm test` 真跑、`git diff` 真喂给 review、commitlint 真校验，替换 LLM 自评 | 是 | 待开始 |
 | **M5** | 多仓库 + 权限收窄 | RepoTarget 支持多仓库、GitHub App 鉴权、幂等防重复触发 | 是 | 待开始 |
@@ -59,7 +59,7 @@
 | 里程碑 | 沉淀的可复用基建 | 解锁的下一里程碑能力 | 前置输入/外部依赖 |
 |---|---|---|---|
 | **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 | GitHub/飞书配置 + 中继可用 |
-| **M2 本地写入** | 编码 agent 真改文件 + 真 commit 的端到端（本地）、guard 权限围栏在写场景的验证 | **M3**：在 M2 基础上加 push + 开 PR + squash merge |
+| **M2 本地写入** | `CODING_REPO_ROOT` 目标仓库配置口子、**已实证的 `guard.ts` 围栏**（受保护路径 / 危险命令 / 越界三类拦截）、`stopAfterCommit` 编排开关、端到端验证脚本骨架 | **M3**：换远端仓库只改 env；红线已实证故敢真 push；`stopAfterCommit=false` 即恢复完整八步 | 编码后端凭据（`~/.claude/settings.json` 的 cc-switch 代理）+ 沙箱仓库 `D:\code\pr-agent-sandbox` |
 | **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库选型在此落定** | **M4**：在真实 PR 上挂真质量闸门 |
 | **M4 真闸门** | `npm test` 真跑 / `git diff` 真喂 review / commitlint 真校验（替换 LLM 自评） | **M5**：把闸门扩展到多仓库 + GitHub App 鉴权 |
 | **M5 多仓库** | RepoTarget 多仓库、GitHub App 鉴权、幂等防重触发 | **M6**：在稳定的多仓库上做可观测与成本 |
