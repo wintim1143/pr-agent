@@ -1,8 +1,13 @@
 # M3 · 完整 PR 闭环（Full PR Loop）
 
-状态：**待开始**
+状态：**待开始**（⚠️ 阻塞在 M3-1：token 缺写权限）
 创建日期：2026-09-15
-**D4 目标仓库（已定）：`wintim1143/pr-agent-e2e`**（用户创建的专用靶场仓库，零污染）
+**D4 目标仓库：`wintim1143/wintim1143-pr-agent-e2e`**（用户 2026-09-15 创建的专用靶场仓库，零污染）
+
+> ⚠️ **仓库名偏差（待拍板）**：实际名字带 `wintim1143-` 前缀，与建卡时预期的 `pr-agent-e2e` 不一致。
+> 仓库当前**为空、无 clone、无任何引用**，改名成本为零（GitHub 会保留旧名重定向）。
+> 两个选项：**（a）改名**为 `pr-agent-e2e`（推荐，名字干净且与文档一致）／**（b）沿用现名**（需同步下方 §1/§7 与环境变量）。
+> 无论选哪个，**都不影响 M3-1 的权限修复** —— 那是独立的硬阻塞。
 
 > **填写分层（先定义、后完善）**
 > - 🟦 **定义期必填**：头部角色责任块 + 第 1–4 节。
@@ -27,7 +32,7 @@
 
 ## 1. 目标（一句话）🟦
 
-**给定一条 issue 形状的入参，dev-workflow 在带远端的靶场仓库 `wintim1143/pr-agent-e2e` 里真建分支 → 真编码 → 过三闸门 → 真 commit → 真 push → 真开 PR → 推飞书卡片 → 挂起等人工确认 → 确认后 squash merge；全程 pr-agent 自身不被触碰。**
+**给定一条 issue 形状的入参，dev-workflow 在带远端的靶场仓库（名字见头部 D4）里真建分支 → 真编码 → 过三闸门 → 真 commit → 真 push → 真开 PR → 推飞书卡片 → 挂起等人工确认 → 确认后 squash merge；全程 pr-agent 自身不被触碰。**
 
 ---
 
@@ -38,7 +43,7 @@
 | **M2 闸门已关** | M2 AC 全绿 + 人工验收通过（2026-09-15）。按用户规则，M3 是当前唯一可推进的里程碑 |
 | **第一次产生「对外可见的产物」** | M1 只读、M2 只写本地 —— 都是自证。M3 产出的 PR 是**摆在 GitHub 上的、可被别人看见的东西**。自动开发从「本地能改」跨到「能交付」 |
 | **红线已被实证，所以才敢真 push** | `guard.ts` 三类拦截在 M2 已端到端验证（run `ba77610d` / `76e7a9e5`）。这个前置不成立时，M3 不该开 |
-| **D4 已定，最后一个外部前置消失** | 目标仓库选定专用靶场 `wintim1143/pr-agent-e2e`：把「链路对不对」与「产物对不对」分开验，出错成本最低 |
+| **D4 已定，最后一个外部前置消失** | 目标仓库选定专用靶场仓库（名字见头部 D4）：把「链路对不对」与「产物对不对」分开验，出错成本最低 |
 | **人工闸门的时机已到** | M2 把关在**里程碑层**（跑完人来看），因为零远端、放行代价可控。M3 能写远端后，放行代价不可控 —— 闸门必须**前置到编排层**（suspend/resume） |
 
 ---
@@ -47,7 +52,7 @@
 
 **做**
 
-- 目标仓库从本地沙箱切到 `wintim1143/pr-agent-e2e`（`CODING_REPO_ROOT` + `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BASE_BRANCH`）
+- 目标仓库从本地沙箱切到靶场仓库（名字见头部 D4）（`CODING_REPO_ROOT` + `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BASE_BRANCH`）
 - `push-open-pr` 真跑：`git push`（token 内嵌 HTTPS URL）+ REST `POST /pulls`
 - `notify` 真推飞书「开发完成」卡片（含分支、PR 号；卡片按钮文案与真实可用通道一致）
 - `merge` 人工关卡：`suspend({waitingFor:'merge-approval'})` → 人工 resume({approved:true}) → REST `PUT /pulls/{n}/merge`（squash）
@@ -67,7 +72,7 @@
 
 ## 4. 端到端演示效果 🟦
 
-跑完 `node scripts/verify-pr-loop.js` 并完成人工确认后，在 **GitHub 网页** `wintim1143/pr-agent-e2e` 上能看到：
+跑完 `node scripts/verify-pr-loop.js` 并完成人工确认后，在 **GitHub 网页** 的靶场仓库（名字见头部 D4）上能看到：
 
 ```
 Pull requests → Closed
@@ -134,13 +139,24 @@ ASCII 速览（M3 范围）：
 
 > 按依赖排序。**M3-1 是硬前置**：靶场仓库与写权限不成立时，后面全部无从验证。
 
-### M3-1 靶场仓库就绪 + GitHub 写权限验证（硬前置）
-- 内容：确认 `wintim1143/pr-agent-e2e` 已创建（空仓或仅有 README）；验证 `GITHUB_TOKEN` 的 **Pull requests: write + Contents: write** 权限真的够（此前从未验证过）。最小验证：直接调 REST 建一个 draft PR 再关掉，或 `git push` 一个空分支再删
-- 验收：`POST /repos/{o}/{r}/pulls` 返回 201 而非 403/422；`git push` 成功
-- ⚠️ 若 token 权限不足 → **立刻停下**，这是 M3 的唯一硬阻塞
+### M3-1 靶场仓库就绪 + GitHub 写权限验证（硬前置）⚠️ **当前阻塞在此**
+- 内容：确认靶场仓库已创建；验证 `GITHUB_TOKEN` 的 **Pull requests: write + Contents: write** 权限真的够（此前从未验证过）
+- **2026-09-15 实测结论（用零副作用探针，见 §11）**：
+
+| 检查项 | 结果 |
+|---|---|
+| 仓库是否存在 | ✅ `wintim1143/wintim1143-pr-agent-e2e`（**名字带 `wintim1143-` 前缀，与预期的 `pr-agent-e2e` 不一致**） |
+| token 是否覆盖该仓库 | ✅ 覆盖（token 为「All repositories」模式，新建仓库自动包含） |
+| `Contents: write`（push 需要） | ❌ **缺** —— `POST /git/refs` 返回 403，头 `x-accepted-github-permissions: contents=write` |
+| `Pull requests: write`（开 PR / merge 需要） | ❌ **缺** —— `POST /pulls` 返回 403，头 `x-accepted-github-permissions: pull_requests=write` |
+| base 分支是否就绪 | ❌ 仓库为空（0 分支），`githubCheckout` 需要一个存在的 base 才能建分支 |
+
+- 验收：`POST /repos/{o}/{r}/pulls` 不再返回 403；`git push` 成功
+- ⚠️ **修法（用户侧，一次性）**：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → 该 token → Repository permissions，把 **Contents** 与 **Pull requests** 改成 `Read and write`。**token 值不变，`.env` 无需改动**
+- ⚠️ 这是 M3 的唯一硬阻塞。在权限补齐前，M3-2 及之后全部无法开工
 
 ### M3-2 目标仓库切换
-- 内容：`scripts/verify-pr-loop.js` 里硬设 `CODING_REPO_ROOT` 指向靶场仓库的**本地 clone**（建议 `D:\code\pr-agent-e2e`），并设 `GITHUB_OWNER=wintim1143` / `GITHUB_REPO=pr-agent-e2e` / `GITHUB_BASE_BRANCH=main`。**不依赖外部 shell 环境**（与 M2 同一安全模式）
+- 内容：`scripts/verify-pr-loop.js` 里硬设 `CODING_REPO_ROOT` 指向靶场仓库的**本地 clone**（建议 `D:\code\pr-agent-e2e`），并设 `GITHUB_OWNER=wintim1143` / `GITHUB_REPO=<靶场仓库名,见头部 D4>` / `GITHUB_BASE_BRANCH=main`。**不依赖外部 shell 环境**（与 M2 同一安全模式）
 - 验收：脚本打印的目标仓库与远端配置正确；前置检查能识别「本地 clone 存在 / 有 remote / 工作区干净」
 
 ### M3-3 push-open-pr 真跑打通
@@ -244,3 +260,21 @@ ASCII 速览（M3 范围）：
   - **M3-1 是硬前置**：需用户确认靶场仓库已建、且 token 具备 Pull requests write 权限（此前从未验证）。若权限不足，M3 无法开工
   - **触发通道**：M3 人工确认走 HTTP resume（与本项目 M1 一致、与「按钮回调属 M5」的既定分工一致）。若要求 M3 就接飞书按钮回调，需把 M5 的 inbound 工作提前，成本显著上升
   - **M3-8 做到哪一半**：仅「判负即终止」还是连「回退 coding 重做」一并做（后者涉及循环与次数上限）
+
+### 2026-09-15 · M3-1 前置探测（建卡当天，用户创建靶场仓库后即时执行）
+- **改了什么**：无代码改动；本卡 M3-1 补实测结论表、头部补「仓库名偏差待拍板」
+- **重点模块**：本卡 §7 M3-1
+- **本轮核实的既有事实**（**全部为实测，非推测**）：
+  - 用户已于 `2026-09-15T03:23Z`（北京时间 11:23）创建仓库，实际名 **`wintim1143/wintim1143-pr-agent-e2e`**（带 `wintim1143-` 前缀），空仓库、`default_branch=main`、0 分支
+  - token 为 **All repositories** 模式：`GET /user/repos` 共 33 个仓库，**包含这个刚创建的新仓库** → 无需为新仓库单独授权
+  - ⚠️ **`Contents: write` 缺失**：探针 `POST /git/refs`（指向全零 SHA）→ 403，响应头 `x-accepted-github-permissions: contents=write`
+  - ⚠️ **`Pull requests: write` 缺失**：探针 `POST /pulls`（head 用不存在的分支名）→ 403，响应头 `x-accepted-github-permissions: pull_requests=write`，body `Resource not accessible by personal access token`
+  - 仓库级 `permissions` 字段（`admin/maintain/push/triage/pull` 全 true）反映的是**登录用户对仓库的权限**，**不代表 token 的权限粒度** —— 这两者容易混，是本轮的关键认知
+  - **零副作用权限探针法（可复用）**：用「必然失败但绝不产生后果」的写请求探测权限 —— `POST /pulls` 传不存在的 head（有权→422、无权→403）、`POST /git/refs` 传全零 SHA（有权→422、无权→403）。响应头 `x-accepted-github-permissions` 在 403 时直接列出缺哪个权限。**比「真建一个再删掉」安全，且同样权威**
+- **踩坑**：
+  1. 空仓库无 base 分支 → `githubCheckout` 的 `createBranchVerified(root, branch, base)` 会失败。**靶场仓库必须先有一个 initial commit**
+  2. 本环境没有 `perl` / `sed`（PortableGit 精简版），批量文本替换要用 `node -e`
+- **待确认**：
+  - **token 权限修复（硬阻塞）**：GitHub → Settings → Developer settings → Fine-grained tokens → 该 token → Repository permissions，把 **Contents** 与 **Pull requests** 改为 `Read and write`。**token 值不变，`.env` 无需改**
+  - **仓库名**：改名 vs 沿用（见头部说明）
+  - **靶场仓库需要 initial commit**（README 即可），否则 M3-2 起 checkout 无 base 可用

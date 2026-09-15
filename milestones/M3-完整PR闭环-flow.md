@@ -41,7 +41,7 @@ flowchart TB
     subgraph EXT["外部系统"]
         CLI["Claude Code CLI 子进程"]
         LOCAL["靶场本地 clone<br/>D:\\code\\pr-agent-e2e"]
-        GH["GitHub 远端<br/>wintim1143/pr-agent-e2e"]
+        GH["GitHub 远端<br/>靶场仓库(名字见 M3 卡头部)"]
         FS["飞书群"]
         HUMAN["👤 用户<br/>看卡片 + 决定是否合并"]
     end
