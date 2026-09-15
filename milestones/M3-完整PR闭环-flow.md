@@ -12,7 +12,7 @@
 flowchart TB
     subgraph TRIGGER["触发层"]
         V["scripts/verify-pr-loop.js<br/>构造 issue 形状入参"]
-        ENV["env 硬设:<br/>CODING_REPO_ROOT = D:\\code\\pr-agent-e2e<br/>GITHUB_OWNER/REPO/BASE_BRANCH"]
+        ENV["env 硬设:<br/>CODING_REPO_ROOT = D:\\code\\pr-agent-e2e<br/>GITHUB_OWNER/REPO/BASE_BRANCH<br/>GIT_PROXY = http://127.0.0.1:7890<br/>(仅调用点注入 -c，不写持久化配置)"]
         RES["外部 resume 调用<br/>(HTTP /api/workflows/.../resume)"]
     end
 
@@ -41,7 +41,7 @@ flowchart TB
     subgraph EXT["外部系统"]
         CLI["Claude Code CLI 子进程"]
         LOCAL["靶场本地 clone<br/>D:\\code\\pr-agent-e2e"]
-        GH["GitHub 远端<br/>靶场仓库(名字见 M3 卡头部)"]
+        GH["GitHub 远端<br/>pr-agent-e2e"]
         FS["飞书群"]
         HUMAN["👤 用户<br/>看卡片 + 决定是否合并"]
     end
@@ -84,6 +84,9 @@ flowchart TB
 - **蓝框是 M3 首次启用的机制**：`suspend` 时把 workflow 快照落库，本次 HTTP 请求就结束了；人工 approve 后是**另一次请求**，上下文必须从库里恢复。M2 因为 `stopAfterCommit=true` 在 suspend **之前**就 return，这条链路**从未被执行过** —— 这是 M3 最高风险项
 - **橙色是人工闸门**：位置在 merge 步的最前面，`suspend` 之前不做任何副作用
 - **飞书卡片是「单向通知」**：M3 只推不收。卡片上的按钮点击会因缺少 inbound 而无效（M5），故卡片文案必须如实说明
+- **`git push` 那一步多带一个 `-c http.proxy`**：本机 `github.com` 直连不通（`api.github.com` 反而直连通），必须经 `127.0.0.1:7890`。
+  代理**只在调用点注入**，不写进任何 `.git/config` —— 代理是本机网络现状、不是项目属性。
+  注意 git 的 `http.proxy` 配置**优先于** `HTTPS_PROXY` 环境变量，故调用点注入能盖掉 shell 里那个坏代理（详见卡 §7 M3-3）
 
 ---
 
@@ -106,7 +109,7 @@ sequenceDiagram
     W->>G: coding(ClaudeSDKAgent 真改文件)
     W->>W: test / review / commit 三闸门
     W->>G: git add -A && git commit
-    W->>GH: git push（token 内嵌 HTTPS）
+    W->>GH: git push（-c http.proxy 注入 + token 内嵌 HTTPS）
     W->>GH: POST /pulls
     GH-->>W: { number: 1, html_url }
     W->>F: 推「开发完成」卡片

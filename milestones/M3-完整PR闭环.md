@@ -1,13 +1,19 @@
 # M3 · 完整 PR 闭环（Full PR Loop）
 
-状态：**待开始**（⚠️ 阻塞在 M3-1：token 缺写权限）
+状态：**待开始**（✅ M3-1 已通过：靶场就绪 + 写权限实测通过 + 真实 push 成功）
 创建日期：2026-09-15
-**D4 目标仓库：`wintim1143/wintim1143-pr-agent-e2e`**（用户 2026-09-15 创建的专用靶场仓库，零污染）
+**D4 目标仓库：`wintim1143/pr-agent-e2e`**（用户 2026-09-15 创建的专用靶场仓库，零污染；同日改名到位）
 
-> ⚠️ **仓库名偏差（待拍板）**：实际名字带 `wintim1143-` 前缀，与建卡时预期的 `pr-agent-e2e` 不一致。
-> 仓库当前**为空、无 clone、无任何引用**，改名成本为零（GitHub 会保留旧名重定向）。
-> 两个选项：**（a）改名**为 `pr-agent-e2e`（推荐，名字干净且与文档一致）／**（b）沿用现名**（需同步下方 §1/§7 与环境变量）。
-> 无论选哪个，**都不影响 M3-1 的权限修复** —— 那是独立的硬阻塞。
+> ✅ **M3-1 硬前置已全部通过（2026-09-15 复测）**：
+> - 仓库名 `wintim1143/pr-agent-e2e` 到位
+> - token **Repository access 已修好** —— 对靶场的 `contents=write` 与 `pull_requests=write` 探针均返回 422（通过鉴权）
+> - **真实写入验证**：用 Contents API 建出 initial commit（`5858bb6` + `b17e66b`），**真实 `git push` 成功**（临时分支 `__push-probe` 创建后删除）
+> - 本地靶场 clone 已就绪：`D:\code\pr-agent-e2e`（main @ `b17e66b`，含 `README.md` 改动靶 + `agent.md` 红线靶）
+>
+> ⚠️ **环境约束（影响 M3-3，不影响 M3-1）**：本机 **`github.com` 主站直连不通**，
+> `git clone/push` 必须经 HTTP 代理 **`127.0.0.1:7890`**。
+> **落地方式已定（2026-09-15）：不写任何持久化 git 代理配置** —— 由脚本在调用点用
+> `git -c http.proxy=...` 注入。详见 §7 M3-3 与 §11 实施日志。
 
 > **填写分层（先定义、后完善）**
 > - 🟦 **定义期必填**：头部角色责任块 + 第 1–4 节。
@@ -32,7 +38,7 @@
 
 ## 1. 目标（一句话）🟦
 
-**给定一条 issue 形状的入参，dev-workflow 在带远端的靶场仓库（名字见头部 D4）里真建分支 → 真编码 → 过三闸门 → 真 commit → 真 push → 真开 PR → 推飞书卡片 → 挂起等人工确认 → 确认后 squash merge；全程 pr-agent 自身不被触碰。**
+**给定一条 issue 形状的入参，dev-workflow 在带远端的 `wintim1143/pr-agent-e2e` 里真建分支 → 真编码 → 过三闸门 → 真 commit → 真 push → 真开 PR → 推飞书卡片 → 挂起等人工确认 → 确认后 squash merge；全程 pr-agent 自身不被触碰。**
 
 ---
 
@@ -43,7 +49,7 @@
 | **M2 闸门已关** | M2 AC 全绿 + 人工验收通过（2026-09-15）。按用户规则，M3 是当前唯一可推进的里程碑 |
 | **第一次产生「对外可见的产物」** | M1 只读、M2 只写本地 —— 都是自证。M3 产出的 PR 是**摆在 GitHub 上的、可被别人看见的东西**。自动开发从「本地能改」跨到「能交付」 |
 | **红线已被实证，所以才敢真 push** | `guard.ts` 三类拦截在 M2 已端到端验证（run `ba77610d` / `76e7a9e5`）。这个前置不成立时，M3 不该开 |
-| **D4 已定，最后一个外部前置消失** | 目标仓库选定专用靶场仓库（名字见头部 D4）：把「链路对不对」与「产物对不对」分开验，出错成本最低 |
+| **D4 已定，最后一个外部前置消失** | 目标仓库选定专用靶场 `wintim1143/pr-agent-e2e`：把「链路对不对」与「产物对不对」分开验，出错成本最低 |
 | **人工闸门的时机已到** | M2 把关在**里程碑层**（跑完人来看），因为零远端、放行代价可控。M3 能写远端后，放行代价不可控 —— 闸门必须**前置到编排层**（suspend/resume） |
 
 ---
@@ -52,7 +58,7 @@
 
 **做**
 
-- 目标仓库从本地沙箱切到靶场仓库（名字见头部 D4）（`CODING_REPO_ROOT` + `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BASE_BRANCH`）
+- 目标仓库从本地沙箱切到 `wintim1143/pr-agent-e2e`（`CODING_REPO_ROOT` + `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BASE_BRANCH`）
 - `push-open-pr` 真跑：`git push`（token 内嵌 HTTPS URL）+ REST `POST /pulls`
 - `notify` 真推飞书「开发完成」卡片（含分支、PR 号；卡片按钮文案与真实可用通道一致）
 - `merge` 人工关卡：`suspend({waitingFor:'merge-approval'})` → 人工 resume({approved:true}) → REST `PUT /pulls/{n}/merge`（squash）
@@ -72,7 +78,7 @@
 
 ## 4. 端到端演示效果 🟦
 
-跑完 `node scripts/verify-pr-loop.js` 并完成人工确认后，在 **GitHub 网页** 的靶场仓库（名字见头部 D4）上能看到：
+跑完 `node scripts/verify-pr-loop.js` 并完成人工确认后，在 **GitHub 网页** 的 `wintim1143/pr-agent-e2e` 上能看到：
 
 ```
 Pull requests → Closed
@@ -139,30 +145,70 @@ ASCII 速览（M3 范围）：
 
 > 按依赖排序。**M3-1 是硬前置**：靶场仓库与写权限不成立时，后面全部无从验证。
 
-### M3-1 靶场仓库就绪 + GitHub 写权限验证（硬前置）⚠️ **当前阻塞在此**
+### M3-1 靶场仓库就绪 + GitHub 写权限验证（硬前置）✅ **已通过（2026-09-15）**
 - 内容：确认靶场仓库已创建；验证 `GITHUB_TOKEN` 的 **Pull requests: write + Contents: write** 权限真的够（此前从未验证过）
-- **2026-09-15 实测结论（用零副作用探针，见 §11）**：
+- **最终验收结论**：
 
 | 检查项 | 结果 |
 |---|---|
-| 仓库是否存在 | ✅ `wintim1143/wintim1143-pr-agent-e2e`（**名字带 `wintim1143-` 前缀，与预期的 `pr-agent-e2e` 不一致**） |
-| token 是否覆盖该仓库 | ✅ 覆盖（token 为「All repositories」模式，新建仓库自动包含） |
-| `Contents: write`（push 需要） | ❌ **缺** —— `POST /git/refs` 返回 403，头 `x-accepted-github-permissions: contents=write` |
-| `Pull requests: write`（开 PR / merge 需要） | ❌ **缺** —— `POST /pulls` 返回 403，头 `x-accepted-github-permissions: pull_requests=write` |
-| base 分支是否就绪 | ❌ 仓库为空（0 分支），`githubCheckout` 需要一个存在的 base 才能建分支 |
+| 仓库名 | ✅ `wintim1143/pr-agent-e2e`（改名到位，前缀偏差已消除） |
+| **`Contents: write`** | ✅ **探针 422**（`POST /git/refs` 全零 SHA → `Object does not exist`，即通过鉴权）<br>✅ **真实写入成功**：Contents API 建出 `README.md`(`5858bb6`) + `agent.md`(`b17e66b`) |
+| **`Pull requests: write`** | ✅ **探针 422**（`POST /pulls` 不存在 head → `Validation Failed: field head invalid`） |
+| **真实 `git push`** | ✅ 成功 —— `push origin main:refs/heads/__push-probe` → `* [new branch]`；`push --delete` 亦成功 |
+| base 分支 | ✅ `main` @ `b17e66b`（2 个提交） |
+| 本地 clone | ✅ `D:\code\pr-agent-e2e`（origin 已配，工作区干净） |
 
-- 验收：`POST /repos/{o}/{r}/pulls` 不再返回 403；`git push` 成功
-- ⚠️ **修法（用户侧，一次性）**：GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens → 该 token → Repository permissions，把 **Contents** 与 **Pull requests** 改成 `Read and write`。**token 值不变，`.env` 无需改动**
-- ⚠️ 这是 M3 的唯一硬阻塞。在权限补齐前，M3-2 及之后全部无法开工
+- **修复过程（两轮，可作为 fine-grained token 排错范本）**：
+  - **第一轮**：权限未改 → 两个探针均 403（`Resource not accessible by personal access token`）
+  - **第二轮**：用户改完权限后，**探针在 `pr-agent` 上变成 422、在靶场上仍是 403**
+    → 说明「权限」已对，但「授权范围」不够：**Repository access 当时是 `Only select repositories` 且只勾了 `pr-agent`**
+    → 全仓库扫描：名下 33 个仓库**只有 `pr-agent` 返回 422，其余 32 个全 403**
+  - **第三轮（本次）**：用户把范围也改好后，靶场两个探针均 422，真实 push 成功 ✅
+- ⚠️ **排错关键认知（踩过）**：`GET /repos/{o}/{r}` 返回 200 **不能**证明 token 覆盖该仓库 ——
+  **public 仓库无需 token 授权即可公开读取**（未认证请求同样 200）。
+  唯一可信判据是**写探针的 403 vs 422**：403 = 未授权/权限不足；422 = 鉴权已过、仅参数不合法。
+- 📌 **对后续里程碑的价值**：修完之后 token 若再对某仓库 403，先看 `Repository access`，再看 `Repository permissions` —— 两个都要对
 
 ### M3-2 目标仓库切换
-- 内容：`scripts/verify-pr-loop.js` 里硬设 `CODING_REPO_ROOT` 指向靶场仓库的**本地 clone**（建议 `D:\code\pr-agent-e2e`），并设 `GITHUB_OWNER=wintim1143` / `GITHUB_REPO=<靶场仓库名,见头部 D4>` / `GITHUB_BASE_BRANCH=main`。**不依赖外部 shell 环境**（与 M2 同一安全模式）
+- 内容：`scripts/verify-pr-loop.js` 里硬设 `CODING_REPO_ROOT` 指向靶场仓库的**本地 clone**（**已就绪：`D:\code\pr-agent-e2e`**），并设 `GITHUB_OWNER=wintim1143` / `GITHUB_REPO=pr-agent-e2e` / `GITHUB_BASE_BRANCH=main`。**不依赖外部 shell 环境**（与 M2 同一安全模式）
 - 验收：脚本打印的目标仓库与远端配置正确；前置检查能识别「本地 clone 存在 / 有 remote / 工作区干净」
+- ⚠️ **`GITHUB_OWNER` / `GITHUB_REPO` 必须显式设置，不能靠自动解析**（2026-09-15 读码发现）：
+  `getGithubConfig()`（`adapters/github.ts:108`）的逻辑是「env 优先，留空则从 `git remote get-url origin` 解析」，
+  而 `parseOwnerRepo()`（`:83`）**执行 `git remote get-url origin` 时未指定 cwd** → 用的是**进程工作目录**，
+  即 `pr-agent` 自己 → 解析出 `wintim1143/pr-agent`。
+  后果是「**push 到靶场 clone，PR 却开到 pr-agent 身上**」这种错位（push 走 `repoRoot()`=`CODING_REPO_ROOT`，
+  owner/repo 却来自进程 cwd）。**M3 起会真写远端，这个错位是不可接受的**。
+  → 两条一起做：① M3-2 硬设三个 env；② 把 `parseOwnerRepo()` 改为基于 `repoRoot()`（消除 cwd 隐式依赖）。
+- 注意：`.env` 里当前**只有 `GITHUB_TOKEN`**，没有 owner/repo —— 所以上述显式设置是必需的，不是可选优化
+- ⚠️ **git 调用需在调用点注入代理**（见 M3-3）：`CODING_REPO_ROOT` 的那份 clone 要能被 push，而本机直连 `github.com` 不通。
+  **不写任何持久化代理配置**，由脚本每次调用加 `-c http.proxy=<GIT_PROXY>`
 
 ### M3-3 push-open-pr 真跑打通
 - 内容：跑通 `git push`（token 内嵌 HTTPS）+ REST 开 PR；处理已存在 PR 的复用分支
 - 验收：远端出现 `feat/<n>-<slug>` 分支；REST 返回 PR number + html_url
 - 注意：现有实现里 `githubPushAndOpenPR` 有「工作树脏则兜底补提交」逻辑 —— 需确认它在 M3 下不会掩盖 commit 步的失败（**兜底提交应当降级为显式报错**，否则 commit 闸门失败会被静默绕过）
+- ⚠️ **`git push` 必须经 HTTP 代理**（2026-09-15 实测，环境级约束）：
+  | 目标 | 直连 | 结果 |
+  |---|---|---|
+  | `api.github.com`（REST） | ✅ 通 | 54ms —— 所以本项目所有 REST 调用**不需要代理** |
+  | `codeload.github.com` | ✅ 通 | 546ms |
+  | **`github.com`（git clone/push 的实际端点）** | ❌ **不通** | 21s 超时（DNS/SNI 阻断） |
+  - 本机可用的 HTTP 代理：**`http://127.0.0.1:7890`**（实测 `CONNECT github.com:443` → `200 Connection established`）
+  - ⚠️ **持久化代理配置已清零，且不再新增**（2026-09-15 用户拍板「清理代理，不要配置新的」）。
+    环境里原有的坏代理只有两个落点，**都已查清**：
+    1. `pr-agent/.git/config` 的 `http.proxy=http://127.0.0.1:10917` —— **仓库级，不是全局**
+       （`~/.gitconfig` 从来没配过任何代理项）。已 `git config --local --unset http.proxy` 删除；
+       并对 `D:\code` / `D:\vipc` 下 36 个本地仓库全量扫过，**无第二处残留**
+    2. 宿主进程注入的环境变量 `HTTPS_PROXY`/`HTTP_PROXY=http://127.0.0.1:14724`（对 github.com 返 502）
+       —— 它**不落盘**（实测 `HKCU\Environment` 与机器级环境变量中均无 proxy 项），属 agent shell 运行时注入，**不动它**
+  - → **唯一落地方式：调用点注入**。脚本对每次 git 调用加 `-c http.proxy=<GIT_PROXY>`；
+    git 的 `http.proxy` **配置优先级高于环境变量**（`http.c` 中 config 命中后不再读 env），
+    所以即便 shell 里挂着坏的 `HTTPS_PROXY` 也能被覆盖。
+    定义 env `GIT_PROXY`，缺省 `http://127.0.0.1:7890` —— 与 `CODING_REPO_ROOT` 同一「不依赖外部环境」模式
+  - ❌ **已否决的两种做法**：① 在靶场 clone 内 `git config http.proxy`（会留下持久化配置）；
+    ② 改全局 `git config --global http.proxy`（同样持久化）。两者都与「不配置新代理」相悖
+  - 注：node 的 `fetch` 是**直连**（Node 24 默认不读 `HTTPS_PROXY`，实测 `NODE_USE_ENV_PROXY` 未设置），
+    这解释了「REST 一直好用、git 一直不好用」的分裂现象
 
 ### M3-4 notify 真推飞书卡片
 - 内容：`buildDevCompleteCard` 补上真实 PR 链接；卡片文案与「按钮回调不可用」的现状一致（避免误导用户去点无效按钮）
@@ -267,6 +313,8 @@ ASCII 速览（M3 范围）：
 - **本轮核实的既有事实**（**全部为实测，非推测**）：
   - 用户已于 `2026-09-15T03:23Z`（北京时间 11:23）创建仓库，实际名 **`wintim1143/wintim1143-pr-agent-e2e`**（带 `wintim1143-` 前缀），空仓库、`default_branch=main`、0 分支
   - token 为 **All repositories** 模式：`GET /user/repos` 共 33 个仓库，**包含这个刚创建的新仓库** → 无需为新仓库单独授权
+    > ⚠️ **此结论已被同日复测推翻，见下节**。`GET /user/repos` 能看到某仓库**不能**证明 token 已授权该仓库 ——
+    > **public 仓库无需 token 授权即可公开读取**，这个列表对判断授权范围没有证明力。
   - ⚠️ **`Contents: write` 缺失**：探针 `POST /git/refs`（指向全零 SHA）→ 403，响应头 `x-accepted-github-permissions: contents=write`
   - ⚠️ **`Pull requests: write` 缺失**：探针 `POST /pulls`（head 用不存在的分支名）→ 403，响应头 `x-accepted-github-permissions: pull_requests=write`，body `Resource not accessible by personal access token`
   - 仓库级 `permissions` 字段（`admin/maintain/push/triage/pull` 全 true）反映的是**登录用户对仓库的权限**，**不代表 token 的权限粒度** —— 这两者容易混，是本轮的关键认知
@@ -276,5 +324,99 @@ ASCII 速览（M3 范围）：
   2. 本环境没有 `perl` / `sed`（PortableGit 精简版），批量文本替换要用 `node -e`
 - **待确认**：
   - **token 权限修复（硬阻塞）**：GitHub → Settings → Developer settings → Fine-grained tokens → 该 token → Repository permissions，把 **Contents** 与 **Pull requests** 改为 `Read and write`。**token 值不变，`.env` 无需改**
+    > ⚠️ **这条修法不完整，已被下节修正**：只改「Repository permissions」不够 —— 还需改「Repository access」。
   - **仓库名**：改名 vs 沿用（见头部说明）
   - **靶场仓库需要 initial commit**（README 即可），否则 M3-2 起 checkout 无 base 可用
+
+### 2026-09-15 · M3-1 复测（用户完成改名 + 改权限后）
+- **改了什么**：无代码改动；本卡 M3-1 结论表重写、头部解除仓库名待拍板、M3-2 补「必须显式设 GITHUB_OWNER/GITHUB_REPO」
+- **重点模块**：本卡 §7 M3-1 / M3-2
+- **用户侧已确认完成**：① 仓库从 `wintim1143-pr-agent-e2e` 改名为 **`wintim1143/pr-agent-e2e`**（✅ 名字已干净）；
+  ② token 权限已改（Contents + Pull requests → Read and write）
+- **本轮核实的既有事实**（全部实测）：
+  - ✅ **仓库名到位**：`GET /repos/wintim1143/pr-agent-e2e` → 200，无 `wintim1143-` 前缀
+  - ✅ **权限本身确实改对了** —— 在 `pr-agent` 上跑同一对探针：
+    `POST /git/refs`（全零 SHA）→ **422 `Object does not exist`**；`POST /pulls`（不存在的 head）→ **422 `Validation Failed: field head invalid`**。
+    **422 是「通过鉴权后的参数校验失败」**，与 403 有本质区别 → 证明 `contents=write` 与 `pull_requests=write` 均已生效
+  - ❌ **但对 `pr-agent-e2e` 两个探针仍是 403** → 问题不在权限，在**授权范围**
+  - 🔑 **决定性证据：对名下 33 个仓库逐跑写探针 → 只有 `wintim1143/pr-agent` 返回 422，其余 32 个全部 403**（含 `pr-agent-e2e`）
+    → token 的 **Repository access = 「Only select repositories」且只勾了 `pr-agent` 一个**
+  - ⚠️ **`GET /repos/wintim1143/pr-agent-e2e` 返回 200 是极具误导性的假信号**：该仓库是 public，
+    **public 仓库无需 token 授权即可公开读取**（未认证请求同样 200）。判断 token 是否覆盖某仓库，
+    **唯一可信判据是写探针的 403 vs 422**，不能看 GET 状态码
+- **修正上一节的两条错误结论**：
+  1. ❌「token 为 All repositories 模式」→ 实为 **Only select repositories（仅 `pr-agent`）**
+  2. ❌「改 Repository permissions 即可」→ 还需改 **Repository access**（见 M3-1 修法）
+- **踩坑**：把「GET 能读到」当成了「token 已授权」—— 这是本轮唯一但关键的误判。
+  根因是 public 仓库的公开读权限与 token 的细粒度授权在 API 表现上无法区分，**必须用写探针区分**
+- **待确认**：
+  - ⚠️ **授权范围（唯一硬阻塞）**：token 的 **Repository access** 改为 `All repositories`（推荐）
+    或 `Only select repositories` 并勾上 `pr-agent-e2e` → **Update token**
+  - **靶场仓库仍需 initial commit**（README 即可）：仓库当前 0 分支，`githubCheckout` 无 base 可用。
+    建议顺手在仓库里放一个受保护文件（如 `agent.md`）作为红线靶子，对齐 M2 沙箱的做法
+  - **M3-2 的 `GITHUB_OWNER`/`GITHUB_REPO` 必须显式设置**（见 M3-2 的解析链分析）—— 否则 PR 会开到 pr-agent 自己身上
+
+### 2026-09-15 · M3-1 通过 + 靶场初始化 + 网络阻塞定位（第三轮）
+- **改了什么**：无 pr-agent 代码改动；**远端靶场仓库真实初始化**（2 个 commit）；本卡 M3-1/M3-2/M3-3 补实测结论；头部状态更新
+- **重点模块**：本卡 §7 M3-1 / M3-2 / M3-3
+- **本轮实际执行的动作（都是真实写远端，非模拟）**：
+  1. 探针复测 → 靶场两个写操作均 **422**（此前 403）→ **权限通了**
+  2. `PUT /contents/README.md` → 201，commit `5858bb6`（**真实写入落盘**）
+  3. `PUT /contents/agent.md` → 201，commit `b17e66b`
+  4. `git clone`（走代理 7890）→ `D:\code\pr-agent-e2e` 就绪
+  5. **真实 `git push`**：`push origin main:refs/heads/__push-probe` → `* [new branch]` ✅
+  6. 清理：`push origin --delete __push-probe` → `- [deleted]` ✅，远端最终只剩 `main`
+- **本轮核实的既有事实（重要，全部实测）**：
+  - 🔑 **`github.com` 主站直连不通，`api.github.com` 直连通** —— 这造成「REST 一直好用、git 一直不好用」的分裂现象。
+    实测：`api.github.com/zen` 200/54ms；`codeload.github.com` 200/546ms；`github.com` **21s 超时**
+  - 🔑 **本机可用代理是 `127.0.0.1:7890`**（`CONNECT github.com:443` → `200 Connection established`）。
+    逐端口扫了 34 个常见代理口，只有 7890 通；1087 超时；
+    **10917** 连不上（落点是 `pr-agent/.git/config` 的**仓库级** `http.proxy`，不是全局，已于同日清理）；
+    **14724** 返 `502 CONNECT tunnel failed`（落点是**宿主注入的环境变量**，不落盘）—— **两个默认落点都是坏的**
+  - 🔑 **node 的 `fetch` 不走代理**：Node 24 默认不读 `HTTPS_PROXY`（`NODE_USE_ENV_PROXY` 未设置），
+    前面所有 REST 调用都是**直连**成功的。所以「env 里配了代理」对 node 无效，但对 git 有效（且指向坏代理）
+  - ⚠️ **GitHub Git Data API 在空仓库上不可用**：`POST /git/blobs` 对 0 commit 的仓库返回
+    **409 `Git Repository is empty.`**。必须先经 **Contents API**（`PUT /contents/{path}`）建出首个 commit，
+    之后 Git Data API 才可用。建 initial commit 只能走 Contents API
+  - ⚠️ **空仓库 409 与权限 403 的区别**：409 是「仓库状态不允许」，也可能出现在有权限时 ——
+    所以探针解读要分场景：空仓库时 `POST /git/refs` 返 **409**，仓库非空后才回到 **422**
+- **踩坑**：
+  1. 第一次 `git clone` 被沙箱网络层拦下（且代理本身也是坏的），留下一个只有空 `.git` 的残留目录 ——
+     **clone 失败后重试前要先清残留**，否则报 `destination path already exists`
+  2. 用 `-c credential.helper='!f(){...}'` 注入 token 而非把 token 写进 URL ——
+     **避免 token 落进 `.git/config`，也避免 git 把带 token 的 URL 打印到输出里**
+- **待确认 / 已闭合**：
+  - ✅ token 授权范围（用户已改，本轮复测通过）
+  - ✅ 靶场 initial commit（本轮已建，`main @ b17e66b`）
+  - ✅ 本地 clone（`D:\code\pr-agent-e2e`）
+  - ✅ **`GIT_PROXY` 落地方式已拍板**（2026-09-15）：脚本调用点注入 `-c http.proxy=$GIT_PROXY`
+    （缺省 `http://127.0.0.1:7890`），**不写任何持久化配置** —— 见下节清理记录
+  - ⬜ **真实建 PR 未做**：`pull_requests:write` 由探针 422 证明，**真实 `POST /pulls` 201 留给 M3-3**
+    （避免在靶场留下无意义的 closed PR）
+
+### 2026-09-15 · 清理 git 代理配置 + 文档校正（用户拍板「不配置新的」）
+- **改了什么**：`pr-agent/.git/config` 删除 `http.proxy`（唯一改动，无代码改动）；本卡 §7 M3-2 / M3-3、§11 上节记录按实测校正
+- **重点模块**：本卡 §7 M3-3（代理落地方式的最终定案）
+- **执行的动作**：
+  1. `git config --local --unset http.proxy` → 删除仓库级 `http.proxy=http://127.0.0.1:10917`
+  2. 复核各层级：`git config --get http.proxy` / `https.proxy` 均返回空（rc=1）→ **无任何层级的代理配置**
+  3. 全量扫描 `D:\code\*`（14 个仓库）+ `D:\vipc\*`（22 个仓库）的仓库级 `http.proxy`/`https.proxy` → **全空**，无第二处残留
+- **本轮核实的事实（修正此前记录的两处错误）**：
+  - ❌ 此前记「**全局** `git config --global http.proxy = 127.0.0.1:10917`」→ 实为 **`pr-agent` 仓库级**。
+    证据：`git config --global --list --show-origin` 只有 `user.*` / `safe.directory` / `http.postbuffer` / `alias.m` / `credential.helper`，
+    **不含任何 proxy 项**；坏代理出现在 `git config --local --list` 的 `file:.git/config` 行
+  - ❌ 此前把 `HTTPS_PROXY=127.0.0.1:14724` 当成「用户配的环境变量」→ 实为**宿主进程注入**：
+    `HKCU:\Environment` 全量枚举（13 项）与机器级环境变量的 `*proxy*` 匹配**均为空**，
+    说明它只存在于 agent shell 的进程环境里，不落盘、不该由项目改动
+- **为什么「不配置新的」是对的（第一性原理）**：
+  代理是**某台机器在某段时间的网络现状**，不是项目的属性。把它写进 `.git/config`（无论全局还是仓库级）
+  等于把「本机网络拓扑」固化进仓库可改动的配置面 —— 换机器就失效，且故障表现是「git 静默连不通」这种最难排查的一类。
+  **正确落点是调用点**：`-c http.proxy=` 只在单次命令生效，缺省值 + env 覆盖，既解决问题又不留副作用
+- **踩坑**：git 的 `http.proxy` **配置优先级高于 `http_proxy`/`HTTPS_PROXY` 环境变量**（`http.c` 中 config 命中后不再读 env）——
+  这既是「清了 local 配置后 shell 里那个坏 env 才会生效」的原因，也是「调用点注入能覆盖坏 env」的依据
+- **待确认**：
+  - ✅ **本轮文档改动已提交**（`docs(m3): 清理 git 代理配置 + 校正落点,代理约束写入卡与流程图`，
+    3 文件 +170/-29；ref 落盘已核验，未触发 ref-not-flushed bug）
+    > 卡内不钉自身提交的 SHA —— 该提交就含本卡，钉了会形成「每次改卡都要再提交一次」的循环。
+    > 需要 SHA 时用 `git log --oneline -1 -- milestones/` 反查
+  - ⬜ 下一步：M3-2 目标仓库切换（显式设 `GITHUB_OWNER`/`GITHUB_REPO` + 修 `parseOwnerRepo()` 的 cwd 隐式依赖）
