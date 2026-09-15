@@ -32,7 +32,9 @@ index.ts  (唯一 Mastra 实例 + LibSQLStore)
 |---|---|---|
 | `index.ts` | 装配唯一 `mastra` 实例；注册 agent / workflow；配 LibSQLStore | `server.ts`、`src/controller/api.controller.ts`、`npx mastra dev`、测试 / 验证脚本 |
 | `server.ts` | 把 Midway 的 Koa app 交给 `@mastra/koa`，挂 `/api/agents`、`/api/workflows` | `src/configuration.ts` `onReady()` |
-| `config.ts` | LLM 中转站配置（`OpenAICompatibleConfig`），全环境变量 | `agents/insight-agent.ts`、`agents/dev-agent.ts` |
+| `config.ts` | LLM 接入装配层（provider 解析 → Mastra `OpenAICompatibleConfig`） | `agents/insight-agent.ts`、`agents/dev-agent.ts` |
+| `llm/providers.ts` | provider 注册表 + 解析/校验（纯数据，不 import Mastra） | `config.ts`、测试 |
+| `progress.ts` | 阶段事件埋点 → JSON Lines 追加到 `logs/dev-workflow.log`（`tail -f` 可实时看） | `workflows/dev-workflow.ts`、`scripts/verify-local-write.js` |
 | `agents/insight-agent.ts` | M1 洞察汇总（只读、结构化 JSON） | `insight-workflow` 的 `summarize` 步 |
 | `agents/dev-agent.ts` | 自动开发主控 + 6 个内联 skill（闸门） | `dev-workflow` 的 test / review / commit 步 |
 | `agents/coding-agent.ts` | 真正写文件的编码体（Claude Code CLI） | `dev-workflow` 的 `coding` 步（**动态 import**） |
@@ -80,18 +82,58 @@ storage:   LibSQLStore({ url: `file:${absPath}` })
 
 业务入口（`POST /api/insights`）**不在** MastraServer 里，而在 `src/controller/api.controller.ts`。
 
-### 2.3 `config.ts` — LLM 中转
+### 2.3 `config.ts` + `llm/providers.ts` — LLM 接入(provider 抽象)
 
 不用 `'openai/<model>'` 字符串（那走 Responses API，中转站基本不兼容），用 `OpenAICompatibleConfig` → `/chat/completions`。
 
+分两层，**加服务商只动注册表**：
+
+| 层 | 文件 | 干什么 |
+|---|---|---|
+| 解析层 | `llm/providers.ts` | `PROVIDERS` 注册表 + `resolveLlmProvider()` → 纯数据 `ResolvedLlmConfig`；`inspectLlmConfig()` 出 error/warn。**不 import Mastra** |
+| 装配层 | `config.ts` | 薄壳：调解析层，把结果转成 Mastra 的 `OpenAICompatibleConfig`。导出名与旧版一致（`llmModelConfig` 等），agents 无需改 import |
+
+**内置 provider**（`llm/providers.ts` 的 `PROVIDERS`）：
+
+| name | 默认 baseURL | 默认模型 | 已知模型清单 |
+|---|---|---|---|
+| `relay` | 无（必须自己填 `LLM_BASE_URL`） | 无（必须填 `LLM_MODEL`） | 不限 |
+| `deepseek` | `https://api.deepseek.com`（**官方不带 `/v1`**） | `deepseek-flash` | `deepseek-flash` / `deepseek-v4-pro` |
+
+新增服务商 = 在 `PROVIDERS` 加一项 `{label, baseURL, protocol, defaultModel?, models?, hint?}`，**不用改 `config.ts`、不用改 workflow**。
+
+优先级：**env 显式值 > provider 默认值**；空白字符串视为未设置（不因空格绕过默认值）。`baseURL` 会去尾部斜杠，与 Mastra 内部 `withoutTrailingSlash` 对齐。
+
 | env | 作用 |
 |---|---|
-| `LLM_PROVIDER` | 标识，默认 `relay` |
-| `LLM_MODEL` | 中转站模型名（必填才真正能 generate） |
-| `LLM_BASE_URL` | 含 `/v1` |
-| `LLM_API_KEY` | 中转站密钥 |
+| `LLM_PROVIDER` | 注册表 key，默认 `relay`；未知值 → error 并提示可用名单 |
+| `LLM_MODEL` | 模型名。留空用 provider 默认值 |
+| `LLM_BASE_URL` | base URL。留空用 provider 默认值。**是否带 `/v1` 因服务商而异**（见下） |
+| `LLM_API_KEY` | 密钥 |
 
-**加载时不抛错**：`npm test` 会 require 本模块，`GET /api/agents` 只列元数据。缺配置推迟到 `agent.generate()`。提前自检用 `missingLlmConfig()`。
+**⚠️ baseURL 与 `/v1`（2026-09-14 修正）**
+
+Mastra 内部固定拼 `baseURL + "/chat/completions"`。**是否让 baseURL 带 `/v1` 取决于服务商，不能一条规则套所有**：
+
+- **DeepSeek 官方不带 `/v1`** —— 官方 curl 示例就是 `curl https://api.deepseek.com/chat/completions`（api-docs.deepseek.com）。
+- 多数中转站（one-api / new-api）端点挂在 `/v1` 下，要写到 `.../v1`。
+
+该事实已固化进注册表默认值。早前版本用全局 `/v1` 正则校验，会把**符合官方文档的 DeepSeek 正确配置**误报成警告（假阳性），已移除。
+
+**校验分级**：
+
+- error = 缺 key / 未知 provider（阻断）
+- warn = 模型名不在 provider 的 `models` 清单里（不阻断）
+
+`models` 清单值得填：**部分服务商对未知模型名会静默回落到默认模型而非报错**。实测 DeepSeek 传 `deepseek-chat` 返回 200，但回包里 `model` 是 `deepseek-flash` —— 请求成功、实际跑的不是你要的模型，不核对回包根本发现不了。所以配置期就要拦住。
+
+**加载时不抛错**：`npm test` 会 require 本模块，`GET /api/agents` 只列元数据。缺配置推迟到 `agent.generate()`。提前自检：
+
+```bash
+node -e "console.log(require('./dist/mastra/config.js').checkLlmConfig())"
+```
+
+`missingLlmConfig()` 只返回 error 级（供 workflow 快速判断能否开跑）；`logLlmConfig(prefix)` 打一行摘要。
 
 ---
 
@@ -120,10 +162,14 @@ skill 与 workflow 步的对应：
 | `coding` | **未被 coding 步使用** | — |
 | `code-testing` | `test` | `{ passed, report }` |
 | `code-review` | `review` | `{ decision, comments }` |
-| `commit-message` | `commit` | `{ message, lintPassed }` |
+| `commit-message` | `commit` | `{ message }` |
 | `merge-pr` | **未被 merge 步使用**（merge 走 REST squash） | — |
 
 `coding` / `merge-pr` 两个 skill 目前是说明书 + 主控 instructions 的一部分，真正落地分别是 `ClaudeSDKAgent` 和 `githubMergePR()`。不要看到 skill 名就以为那一步在调它。
+
+**⚠️ 输出形状由闸门定，不由 skill 定**（2026-09-15）：`runGate` 的 prompt 里有一段「输出契约(强制)」，逐字列出 JSON 字段 + 示例；skill 的 `instructions` 只描述「怎么做这件事」，结尾统一声明「输出形状以调用方指定的结构化契约为准」。改 schema 必须同步改 prompt —— **只改一边会让闸门恒失败**（2026-09-14 实测：commit 步 3 次重试 byte 级相同，模型按 skill 格式输出 `{type,scope,subject,body}`，而 schema 要 `{message}`）。
+
+同理，skill 里不得出现**项目未安装工具的指令**（原 `commit-message` 写着「必须过 commitlint」、`code-review` 写着「跑 lint」——两者在本仓库都不存在）。这类指令的后果不是"多做一点"，而是诱导模型**声称做过实际没做的事**，直接污染闸门判定。
 
 ### 3.3 `coding-agent.ts` 关键点
 
@@ -405,6 +451,7 @@ flowchart TB
 
   IA --> CFG["config.ts"]
   DA --> CFG
+  CFG --> PRV["llm/providers.ts"]
 
   IW --> GR["integrations/github-readonly.ts"]
   IW --> FI["integrations/feishu.ts"]
@@ -413,6 +460,7 @@ flowchart TB
 
   DW --> GHA["adapters/github.ts"]
   DW --> FSA
+  DW --> PRG["progress.ts"]
   DW -.->|"运行时 getAgent"| DA
   DW -.->|"动态 import"| CA["agents/coding-agent.ts"]
   CA --> GD["agents/guard.ts"]
@@ -451,7 +499,9 @@ flowchart TB
 |---|---|---|
 | 洞察 JSON 结构 / prompt | `insight-workflow.ts` 的 prompt + `InsightSchema`；同步 `insight-agent.ts` instructions | 不要在 collect 里调 LLM |
 | LLM 超时 / 重试 | `insight-workflow.ts` `LLM_TIMEOUT_MS` / `LLM_MAX_ATTEMPTS` | 不要改 `config.ts` 来「修超时」 |
-| 换中转站 | `.env` 的 `LLM_*` | 不要把 key 写进 `config.ts` |
+| 换服务商 / 换中转站 | `.env` 的 `LLM_PROVIDER` + `LLM_*` | 不要把 key 写进 `config.ts` |
+| 新增一个内置服务商 | `llm/providers.ts` 的 `PROVIDERS` 加一项 | 不要改 `config.ts` 或 workflow |
+| 加阶段埋点 | `progress.ts` 的 `stage()` / `stageStart()`；在 workflow 步内调用 | 不要 `console.log`（会被 Mastra 日志淹没，且不落文件） |
 | 飞书卡片长什么样 | `adapters/feishu.ts` `buildCard` / `buildDevCompleteCard` | workflow 只拼 markdown |
 | GitHub 开 PR / merge 行为 | `adapters/github.ts` | 不要在 step 里直接 `fetch` |
 | 编码体乱改 workflow / `.env` | `agents/guard.ts` `PROTECTED_PATHS` / `DANGEROUS_COMMANDS` | 不要指望 `allowedTools`（bypass 下无效） |

@@ -18,6 +18,7 @@
  *   node scripts/verify-local-write.js --turns 1       # 覆盖 CODING_MAX_TURNS(失控上限观察)
  *
  * 证据落 logs/m2-verify.log(带时间戳,避免管道缓冲丢失)。
+ * 阶段事件另落 logs/dev-workflow.log(JSON Lines,可 `tail -f` 实时观察)。
  */
 'use strict';
 require('dotenv').config();
@@ -28,6 +29,7 @@ const { execFileSync } = require('node:child_process');
 const SANDBOX = process.env.M2_SANDBOX || 'D:\\code\\pr-agent-sandbox';
 const PR_AGENT = path.resolve(__dirname, '..');
 const LOG = path.resolve(__dirname, '../logs/m2-verify.log');
+const PROGRESS_LOG = path.resolve(__dirname, '../logs/dev-workflow.log');
 
 const argv = process.argv.slice(2);
 const RESET = argv.includes('--reset');
@@ -142,6 +144,27 @@ function withGuard(promise, ms, label) {
   // 硬编码 900s 不够用。默认仍 900s,可用 VERIFY_TOTAL_GUARD_MS 覆盖。
   const totalGuardMs = Number(process.env.VERIFY_TOTAL_GUARD_MS ?? 900_000);
   log(`  → start() 中(总守卫 ${Math.round(totalGuardMs / 1000)}s,单步编码守卫由 workflow 内的 CODING_TIMEOUT_MS 负责)...`);
+  log(`  ⏱  实时进度: 另开终端执行  tail -f logs/dev-workflow.log  (或看本终端上方心跳行)`);
+  log(`      心跳间隔 ${Number(process.env.PR_AGENT_HEARTBEAT_MS ?? 30_000) / 1000}s;设 PR_AGENT_HEARTBEAT_MS=0 关闭`);
+
+  // 本地心跳(2026-09-14 补):workflow 内部的心跳只在 coding 步生效,且可能因 stdout 缓冲
+  // 而滞后。这里由验证脚本自己起一个「我还活着」计时器,并顺带把 dev-workflow.log 的
+  // 最新一条阶段事件回显出来 —— 长等待期可实时看到走到了哪一步。
+  const hbMs = Number(process.env.VERIFY_HEARTBEAT_MS ?? 30_000);
+  let hbTimer;
+  if (hbMs > 0) {
+    hbTimer = setInterval(() => {
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(0);
+      let lastStage = '';
+      try {
+        const evts = fs.readFileSync(PROGRESS_LOG, 'utf8').trim().split('\n');
+        const last = JSON.parse(evts[evts.length - 1]);
+        lastStage = ` | 最新阶段事件: ${last.stage || '-'} ${last.event}` +
+          (last.durationMs ? ` (${(last.durationMs / 1000).toFixed(1)}s)` : '');
+      } catch { /* 日志还没生成,忽略 */ }
+      log(`  ⏳ 仍在运行 ${elapsed}s${lastStage}`);
+    }, hbMs);
+  }
 
   let result;
   try {
@@ -151,10 +174,12 @@ function withGuard(promise, ms, label) {
       'workflow'
     );
   } catch (e) {
+    if (hbTimer) clearInterval(hbTimer);
     log('\n✗ workflow 抛错:', e?.message || e);
     log('  → 检查 logs/ 与上方输出定位;若编码相关,确认 ~/.claude/settings.json 的代理端点可用。');
     process.exit(1);
   }
+  if (hbTimer) clearInterval(hbTimer);
 
   log(`  status = ${result.status}`);
 
