@@ -37,7 +37,15 @@ export type ProgressEvent =
   | 'step:fail'
   | 'llm:start'
   | 'llm:done'
-  | 'llm:retry';
+  | 'llm:retry'
+  /**
+   * 围栏拦截(M3-6,2026-09-15 新增)。
+   *
+   * 为什么需要:guard.ts 拦下一次工具调用时只打 `console.warn`,而终端输出会随会话消失
+   * —— 「红线确实生效了」这件事**事后无法从任何持久化文件证明**。
+   * M3-6 的验收恰恰要求「deny 日志出现且远端未受影响」,故把拦截动作落成结构化事件。
+   */
+  | 'guard:deny';
 
 export interface ProgressFields {
   /** 流水线阶段名(checkout / coding / test / review / commit / push-open-pr / notify / merge) */

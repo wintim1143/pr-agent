@@ -114,6 +114,14 @@ const ContextSchema = z.object({
   reviewResult: ReviewGateSchema.optional(),
   commitResult: CommitGateSchema.optional(),
   prNumber: z.number().optional(),
+  /**
+   * PR 网页链接(M3-4 补)。
+   *
+   * 原先只有 `prNumber`,飞书卡片上就只能显示一个光秃秃的 `#1` —— 收到通知的人
+   * 没法一键跳转,得自己去仓库里翻 PR 列表。链接是 push-open-pr 步从 REST 响应里
+   * 已经拿到的字段(`html_url`),此前只是没往上下文里存。
+   */
+  prUrl: z.string().optional(),
   mergeResult: z.string().optional(),
 });
 /**
@@ -378,8 +386,33 @@ const testStep = createStep({
           `改动为空或明显不完整时判 false,并在 report 里说明缺什么。**不要为看不见的内容背书。**`,
         TestGateSchema
       );
-      // TODO: passed=false 时回到 coding 重做(条件边 branch/dowhile,见文档 §十二)
-      p.done({ passed: testResult.passed });
+      // M3-8:闸门判负 → **显式终止**,不再往下走 review / commit / push-open-pr。
+      //
+      // ## 为什么是 throw,而不是 Mastra 条件边(`.branch()`)
+      //
+      // 卡里原本设想的形态是「条件边判负则终止」。实测否定了这个方案
+      // (证据:`.tmp/branch-probe.js` / `.tmp/branch-probe2.js`,@mastra/core 1.63.2):
+      //
+      // 1. **branch 的多条条件不是互斥的,而是「谁为真谁就执行」**。兜底分支
+      //    (`async () => true`)会让**所有**分支都跑 —— 实测 `b-pass` 与 `b-other`
+      //    在同一次运行里都执行了。没有「else」语义,无法表达「二选一」。
+      // 2. **branch 之后链接的 `.then(step)` 收到的 inputData 是聚合对象**
+      //    `{ '<stepId>': <该步输出>, ... }`,不再是上一步的输出。实测 c 的入参是
+      //    `{"b-pass":{...},"b-other":{...}}`,于是 `inputData.branch` / `inputData.prNumber`
+      //    全部读不到 —— 与本文件「八步全链路共用同一个 ContextSchema」的约定直接冲突。
+      // 3. branch 内 step 抛错 → run `status=failed` 且后续步骤不执行(实测)。**终止本来就该用 throw**。
+      //
+      // 结论:闸门判负的终止路径用「step 内显式失败」表达 —— 语义等价(后续一律不执行),
+      // 且是 fail-closed。**有意只做「终止」,不做「回退 coding 重做」**:回退需要循环
+      // (`.dowhile()`)+ 次数上限 + 失败累积策略,属独立工作量,M3 范围外(见卡 §7 M3-8)。
+      if (!testResult.passed) {
+        const msg =
+          `GATE_REJECTED@test: 测试闸门判负,终止流水线(不进入 review/commit/push)。` +
+          `报告: ${testResult.report.slice(0, 300)}`;
+        p.fail(msg, { passed: false });
+        throw new Error(msg);
+      }
+      p.done({ passed: true });
       return { ...inputData, testResult };
     } catch (e) {
       p.fail(e);
@@ -414,8 +447,19 @@ const review = createStep({
           `**不要为看不见的内容背书。**`,
         ReviewGateSchema
       );
-      // TODO: decision=request-changes 时回到 coding(条件边,见文档 §十二)
-      p.done({ decision: reviewResult.decision });
+      // M3-8:审核判负 → **显式终止**(同 test 步,理由与 branch 实测结论见该步注释)。
+      // 这一条比 test 那条更关键:review 通过与否决定「这次改动值不值得进远端」。
+      // 修之前 review 判 `request-changes` 后流程**照旧 commit 并 push 开 PR** ——
+      // 等于把「审核明确否决的改动」推到远端,而 PR 描述里还写着 decision=request-changes。
+      // M2 时代价有限(只落在本地工作区),M3 起改动会被推到真实仓库,误判代价不可逆。
+      if (reviewResult.decision === 'request-changes') {
+        const msg =
+          `GATE_REJECTED@review: 审核判 request-changes,终止流水线(不进入 commit/push)。` +
+          `意见: ${reviewResult.comments.join('; ').slice(0, 300) || '(无)'}`;
+        p.fail(msg, { decision: 'request-changes' });
+        throw new Error(msg);
+      }
+      p.done({ decision: 'approve' });
       return { ...inputData, reviewResult };
     } catch (e) {
       p.fail(e);
@@ -511,7 +555,10 @@ const pushOpenPr = createStep({
       } else {
         p.done({});
       }
-      return { ...inputData, prNumber: res.prNumber };
+      // M3-4:把 PR 链接一并带进上下文,供 notify 步渲染成卡片上的可点链接。
+      // 注意 `?? undefined`:`PushPrResult.prUrl` 是 `string | null`,而 ContextSchema
+      // 的 prUrl 是 `z.string().optional()`(不接受 null)。直接透传会让 zod 校验失败。
+      return { ...inputData, prNumber: res.prNumber, prUrl: res.prUrl ?? undefined };
     } catch (e) {
       p.fail(e);
       throw e;
@@ -545,6 +592,7 @@ const notify = createStep({
           issueTitle: inputData.issueTitle,
           branch: inputData.branch,
           prNumber: inputData.prNumber,
+          prUrl: inputData.prUrl,
         })
       );
       if (!res.ok) {
@@ -561,7 +609,29 @@ const notify = createStep({
   },
 });
 
-// 8. merge(强制,需用户确认):suspend 等人点"合并"→ REST squash merge 合入 base
+/**
+ * 人工合并关卡的三种结局(M3-5 定稿,2026-09-15)。
+ *
+ * `resumeData` 有三种形态,必须**分别**处理,不能都归到「没批准就挂起」:
+ *
+ * | 输入 | 语义 | 动作 |
+ * |---|---|---|
+ * | 从未 resume(首次执行) | 还没人看 | `suspend()` 挂起等人 |
+ * | `resume({ approved: true })`  | 批准 | 真 squash merge |
+ * | `resume({ approved: false })` | **明确拒绝** | **终止**,PR 保持 open |
+ *
+ * ## 为什么「明确拒绝」不能落回 suspend
+ *
+ * 原实现写成 `if (!resumeData || !approved) suspend()` —— 于是「明确拒绝」和
+ * 「还没表态」走了同一条路:**拒绝之后又挂起一次**。用户在卡片上点「❌ 拒绝」,
+ * 会看到同一张卡片再次出现,再点再出现 —— 一个**永远点不掉的循环**,
+ * 和 M3-3 里「push 失败仍走到 suspend」是同一类坑(挂起状态与真实意图矛盾)。
+ *
+ * ## 为什么拒绝时 run 状态是 success 而不是 failed
+ *
+ * 「拒绝」是**合法的人工决策**,不是流水线故障。把它记成失败会污染
+ * 「哪些 run 真的坏了」这一判断;正确做法是正常结束 + `mergeResult` 写明结局。
+ */
 const merge = createStep({
   id: 'merge',
   description: '用户确认后经 GitHub REST API 对 PR 执行 squash merge',
@@ -573,14 +643,29 @@ const merge = createStep({
     if (inputData.stopAfterCommit) {
       return { ...inputData, mergeResult: '(skipped: stopAfterCommit,M2 不执行合并关卡)' };
     }
-    // 未收到用户确认 → 挂起,等飞书卡片点"合并"后 resume({ approved: true })
-    if (!resumeData || !(resumeData as { approved?: boolean }).approved) {
+    const decision = (resumeData ?? {}) as { approved?: boolean };
+
+    // ① 明确拒绝 → 终止(不合并,也不再挂起,理由见上方注释块)
+    if (resumeData && decision.approved === false) {
+      const p = stageStart('merge', 'rejected');
+      const mergeResult = 'merge-skipped: 用户明确拒绝,PR 保持 open(未合并,可由人工处置)';
+      console.log(`[merge] ${mergeResult}`);
+      // 刻意不关 PR:关闭是另一个不可逆动作,且「拒绝合并」与「废弃这个 PR」
+      // 不是同一件事 —— 留 open 让人自己决定关还是改。
+      p.done({ merged: false, reason: 'user-rejected' });
+      return { ...inputData, mergeResult };
+    }
+
+    // ② 尚未表态(首次进入 / resume 未带 approved)→ 挂起等人确认
+    if (decision.approved !== true) {
       stage('step:start', { stage: 'merge', waitingFor: 'merge-approval' });
       return suspend({
         waitingFor: 'merge-approval',
         issueNumber: inputData.issueNumber,
       });
     }
+
+    // ③ 批准 → 真合并
     const p = stageStart('merge', 'resumed');
     // 已确认:真实合并。没开出 PR(prNumber=0)就没东西可合,标记失败供上层判读。
     if (!inputData.prNumber || inputData.prNumber <= 0) {
@@ -616,7 +701,9 @@ const merge = createStep({
  * 组装 workflow。
  * - `mastra` 不在此传入:由 index.ts 的 `new Mastra({ workflows })` 自动注入。
  * - 用 `.then()` 串联步骤(第一个步骤也用 `.then()`),末尾 `.commit()`。
- * - 失败时回退 coding 的条件边(branch/dowhile)是后续细化项,见文档 §十二。
+ * - **闸门判负的终止不走 Mastra 条件边**:实测 `1.63.2` 的 `.branch()` 多条件不互斥、
+ *   且分支后 `.then()` 的 inputData 会变成 `{stepId: output}` 聚合对象(证据 `.tmp/branch-probe*.js`),
+ *   与「全链路共用 ContextSchema」冲突。改为「闸门内显式 throw」,见 test / review 两步的注释。
  */
 export const devWorkflow = new Workflow({
   id: 'dev-workflow',

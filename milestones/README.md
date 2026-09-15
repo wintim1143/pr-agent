@@ -33,7 +33,7 @@
 |---|---|---|---|---|
 | **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ **已完成**（AC-1~AC-7 全量复验通过 + 人工验收通过） |
 | **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | ✅ **已完成**（AC 全绿 + 人工验收通过，2026-09-15 归档）—— 卡：[`M2-本地写入闭环.md`](./M2-本地写入闭环.md) · 验收操作：[`M2-人工验收手册.md`](./M2-人工验收手册.md) |
-| **M3** | 完整 PR 闭环 | push + 开 PR + 人工确认 → squash merge | 是 | 🟡 **进行中**（✅ M3-1 靶场+写权限；✅ M3-2 目标仓库切换 + `parseOwnerRepo` cwd 修复；✅ **M3-3 真 push + 真开 PR #1 + 停在 merge 关卡**（3/3 通过）→ **下一步 M3-4 / M3-5**）—— 卡：[`M3-完整PR闭环.md`](./M3-完整PR闭环.md) |
+| **M3** | 完整 PR 闭环 | push + 开 PR + 人工确认 → squash merge | 是 | ✅ **已完成（2026-09-15）**——八项任务全过：M3-1 靶场+写权限 / M3-2 目标仓库切换 / M3-3 真 push+真开 PR / M3-4 飞书卡片（含 PR 链接）/ **M3-5 跨进程 suspend-resume（含真 squash merge）** / M3-6 远端红线 / M3-7 验证脚本+AC 回填 / M3-8 判负即终止。⚠️ 遗留：**AC-7 需人工去飞书群确认**、远端 PR #1/#2 与 `feat/*` 分支待清理 —— 卡：[`M3-完整PR闭环.md`](./M3-完整PR闭环.md) |
 | **M4** | 真质量闸门 | 把**程序可判定的事实**从 LLM 手里收回：`npm test` 真跑取 exit code，替换 LLM 自评 | 是 | 待开始（⚠️ **范围已缩小**，见下方注） |
 | **M5** | 多仓库 + 权限收窄 | RepoTarget 支持多仓库、GitHub App 鉴权、幂等防重复触发 | 是 | 待开始 |
 | **M6** | 可观测与成本 | run 追踪、LLM 成本回写、失败重试与告警 | — | 待开始 |
@@ -66,7 +66,7 @@
 |---|---|---|---|
 | **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 | GitHub/飞书配置 + 中继可用 |
 | **M2 本地写入** | `CODING_REPO_ROOT` 目标仓库配置口子、**已实证的 `guard.ts` 围栏**（受保护路径 / 危险命令 / 越界三类拦截）、`stopAfterCommit` 编排开关、端到端验证脚本骨架 | **M3**：换远端仓库只改 env；红线已实证故敢真 push；`stopAfterCommit=false` 即恢复完整八步 | 编码后端凭据（`~/.claude/settings.json` 的 cc-switch 代理）+ 沙箱仓库 `D:\code\pr-agent-sandbox` |
-| **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库 = 专用靶场 `wintim1143/pr-agent-e2e`（已定）** | **M4**：在真实 PR 上挂真质量闸门 |
+| **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库 = 专用靶场 `wintim1143/pr-agent-e2e`（已定）** | **M4**：在真实 PR 上挂真质量闸门 | 靶场仓库 + fine-grained token（Contents/Pull requests = write） |
 | **M4 真闸门** | `npm test` 真跑 / `git diff` 真喂 review / commitlint 真校验（替换 LLM 自评） | **M5**：把闸门扩展到多仓库 + GitHub App 鉴权 |
 | **M5 多仓库** | RepoTarget 多仓库、GitHub App 鉴权、幂等防重触发 | **M6**：在稳定的多仓库上做可观测与成本 |
 | **M6 可观测** | run 追踪、成本回写、失败重试与告警 | （终点） |
@@ -97,7 +97,8 @@ milestones/
 ├── M1-只读洞察闭环.md / -flow.md        ← ✅ 已完成
 ├── M2-本地写入闭环.md / -flow.md        ← ✅ 已完成（2026-09-15 归档）
 ├── M2-人工验收手册.md                   ← M2 的复现手册（已验收，保留作复现用）
-└── M3-完整PR闭环.md / -flow.md          ← 🟡 当前里程碑
+├── M3-完整PR闭环.md / -flow.md          ← ✅ 已完成（2026-09-15）· 八项任务全过
+└── （M4 卡待建）                         ← ⬜ 下一个里程碑
 ```
 
 单个里程碑卡统一包含十节（🟦=定义期必填，🟨=实施期渐进补全）：

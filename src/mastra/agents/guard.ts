@@ -63,31 +63,131 @@ const WRITE_TOOLS: Readonly<Record<string, readonly string[]>> = {
 };
 
 /**
+ * 默认受保护分支 —— 禁止 agent 直接 push 到这些分支(`agent.md` git 红线第 2 条)。
+ *
+ * ## 为什么是可注入的,而不是写死在正则里(M3-6,2026-09-15)
+ *
+ * 原实现把分支名硬编码成 `(?:main|master)`,但本项目的 base 分支由
+ * `GITHUB_BASE_BRANCH` 决定(靶场仓库可用任意名)。只要它不叫 main/master,
+ * 「禁直推 base」这条拦截就**静默失效** —— 不报错、不告警,只是不再拦。
+ * 围栏的失效必须是显式的,所以改为可注入:调用方把实际 base 分支传进来。
+ *
+ * ⚠️ **传入项只增不减**:`resolveProtectedBranches()` 取并集,不可能靠传参
+ * 把 main/master 移出保护名单 —— 防止「配置写错 → 保护范围缩水」这类
+ * 「看起来配了、其实裸奔」的失败形态。
+ */
+export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ['main', 'master'];
+
+/** 合并调用方传入的分支与默认值(并集、去重、剔除空白项)。 */
+export function resolveProtectedBranches(extra?: readonly string[]): string[] {
+  const set = new Set<string>(DEFAULT_PROTECTED_BRANCHES);
+  for (const b of extra ?? []) {
+    const t = typeof b === 'string' ? b.trim() : '';
+    if (t) set.add(t);
+  }
+  return [...set];
+}
+
+/** 转义分支名里的正则元字符(如 `release/1.0` 的 `.`、`hotfix+v2` 的 `+`)。 */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
  * 危险 shell 命令模式。
  *
- * 每条都对应 `agent.md` 的一条红线或一类不可逆损害：
- * - force push / 直推 main：git 红线第 2 条
- * - reset --hard / clean -fd：丢弃未提交工作，不可逆
- * - rm -rf：不可逆删除
- * - 写 .git/ 内部：绕过所有 git 层保护
+ * 每条都对应 `agent.md` 的一条红线或一类不可逆损害。分两个维度:
+ *
+ * ### 本地维度(原有)
+ * - force push / 直推 main:git 红线第 2 条
+ * - reset --hard / clean -fd:丢弃未提交工作,不可逆
+ * - rm -rf:不可逆删除
+ * - 写 .git/ 内部:绕过所有 git 层保护
+ *
+ * ### 远端维度(M3-6 新增,2026-09-15)
+ *
+ * 动因:M2 之前流程只写本地,「不可逆」的边界就在本机。M3 起会真 push、真开 PR,
+ * 于是**远端不可逆操作**成了新的风险面 —— 而原危险命令表只覆盖了 force push 与
+ * 直推 main 两条,以下全部漏网:
+ * - `--mirror` / `--all` / `--tags`:把本地全部 ref 同步到远端(或反向删远端 ref)
+ * - `--prune`:删除远端有而本地没有的分支 —— 一次命令清掉别人的分支
+ * - `-d` / `--delete` / 空 refspec(`git push origin :branch`):删远端分支
+ * - `git remote set-url|rename|remove|set-head`:篡改远端指向或默认分支
+ * - `gh repo edit|delete`:改远端仓库设置(含默认分支)
+ *
+ * @param protectedBranches 受保护分支名(通常来自 `GITHUB_BASE_BRANCH` 与默认值的并集)
  */
-const DANGEROUS_COMMANDS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
-  { pattern: /\bgit\s+push\b[^\n]*?\s(?:-f|--force)\b/, reason: '禁止 force push（git 红线）' },
-  {
-    pattern: /\bgit\s+push\b[^\n]*?\b(?:origin[^\n]*?)?\b(?:main|master)\b/,
-    reason: '禁止直推 main/master（git 红线）',
-  },
-  { pattern: /\bgit\s+reset\s+--hard\b/, reason: 'git reset --hard 会丢弃未提交改动，不可逆' },
-  { pattern: /\bgit\s+clean\s+-[a-z]*f/, reason: 'git clean -f 会删除未跟踪文件，不可逆' },
-  { pattern: /\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r/, reason: 'rm -rf 不可逆删除' },
-  { pattern: /\bgit\s+checkout\s+(?:-B\s+)?(?:main|master)\b/, reason: '禁止切换到 main/master 分支' },
-  { pattern: /\bgit\s+branch\s+-[a-zA-Z]*D\b/, reason: '禁止强制删除分支' },
-  { pattern: />\s*\.git\//, reason: '禁止直接写 .git/ 内部（绕过 git 层保护）' },
-  { pattern: /\b(?:gh|git)\s+auth\b/, reason: '禁止操作凭据（gh/git auth）' },
-  { pattern: /\bgh\s+pr\s+(?:merge|close)\b/, reason: '合并/关闭 PR 由人工关卡负责，agent 不得越权' },
-  { pattern: /\bsudo\b/, reason: '禁止提权' },
-  { pattern: /\bcurl\b[^\n]*?(?:\|\s*(?:ba)?sh|\s-o\s)/, reason: '禁止下载即执行 / 下载落盘' },
-];
+function buildDangerousCommands(
+  protectedBranches: readonly string[]
+): ReadonlyArray<{ pattern: RegExp; reason: string }> {
+  const branchAlt = protectedBranches.map(escapeRegExp).join('|');
+  /**
+   * 直推受保护分支的检测。
+   *
+   * 只认**出现在 refspec 位置**的分支名,不做全文子串匹配。
+   * 反例(原实现的真实缺陷):`git push origin feat/add-main-section` —— 分支名里
+   * 嵌了 `main`,`-` 是词边界,于是 `\bmain\b` 命中,**正常推自己的分支被误拦**。
+   *
+   * 本正则要求 base 名满足:
+   *   - 前面是空白(token 起点),之前至多允许一个 `+`(force refspec)与 `src:`(src:dst 形态)
+   *   - 允许 `refs/heads/` 前缀(`HEAD:refs/heads/main` 形态)
+   *   - 后面是空白或行尾(`main-x` / `main.py` 不算)
+   *
+   * 因此 `feat/add-main-section`(前缀是 `-`)、`feature/main`(前缀是 `/`)都不命中。
+   */
+  const pushProtected = new RegExp(
+    `\\bgit\\s+push\\b[^\\n]*?\\s\\+?(?:[^\\s:]+:)?(?:refs/heads/)?(?:${branchAlt})(?=\\s|$)`
+  );
+
+  return [
+    // ---------- 远端维度(M3-6) ----------
+    {
+      // `-f` / `-fu` / `-uf` 这类短选项组合也要覆盖:原正则 `\s(?:-f|--force)\b`
+      // 只认孤立的 `-f`,漏掉了 `git push -uf origin x`。
+      // `--force` 同时覆盖 `--force-with-lease`(无人值守下同样不得改写远端历史)。
+      pattern: /\bgit\s+push\b[^\n]*?(?:\s-[a-zA-Z]*f[a-zA-Z]*(?=\s|$)|--force)/,
+      reason: '禁止 force push(含 -f 短选项组合与 --force-with-lease):无人值守下不得改写远端历史',
+    },
+    {
+      pattern: /\bgit\s+push\b[^\n]*?--(?:mirror|prune|all|tags)\b/,
+      reason:
+        '禁止 git push --mirror/--all/--tags/--prune:会把本地全部 ref 同步到远端、或删除远端 ref,影响范围不可控',
+    },
+    {
+      pattern: /\bgit\s+push\b[^\n]*?(?:\s-d(?=\s|$)|--delete\b)/,
+      reason: '禁止删除远端分支(git push -d / --delete)',
+    },
+    {
+      // 空 source refspec = 删除远端同名分支,如 `git push origin :feat/x`。
+      // 要求 `:` 紧跟在空白(or `+`)之后,故 `HEAD:refs/heads/x` 不误报。
+      pattern: /\bgit\s+push\b[^\n]*?\s\+?:/,
+      reason: '禁止用空 refspec 删除远端分支(如 `git push origin :branch`)',
+    },
+    {
+      pattern: /\bgit\s+remote\s+(?:remove|rm|rename|set-url|set-head|set-branches)\b/,
+      reason: '禁止篡改 remote 配置(可改远端指向或默认分支)',
+    },
+    {
+      pattern: /\bgh\s+repo\s+(?:edit|delete|rename|archive)\b/,
+      reason: '禁止改动远端仓库设置(含默认分支)',
+    },
+    {
+      pattern: pushProtected,
+      reason: `禁止直推受保护分支(${protectedBranches.join(' / ')}):改动必须经人工关卡合入`,
+    },
+    // ---------- 本地维度(原有) ----------
+    { pattern: /\bgit\s+reset\s+--hard\b/, reason: 'git reset --hard 会丢弃未提交改动,不可逆' },
+    { pattern: /\bgit\s+clean\s+-[a-z]*f/, reason: 'git clean -f 会删除未跟踪文件,不可逆' },
+    { pattern: /\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r/, reason: 'rm -rf 不可逆删除' },
+    { pattern: /\bgit\s+checkout\s+(?:-B\s+)?(?:main|master)\b/, reason: '禁止切换到 main/master 分支' },
+    { pattern: /\bgit\s+branch\s+-[a-zA-Z]*D\b/, reason: '禁止强制删除分支' },
+    { pattern: />\s*\.git\//, reason: '禁止直接写 .git/ 内部(绕过 git 层保护)' },
+    { pattern: /\b(?:gh|git)\s+auth\b/, reason: '禁止操作凭据(gh/git auth)' },
+    { pattern: /\bgh\s+pr\s+(?:merge|close)\b/, reason: '合并/关闭 PR 由人工关卡负责,agent 不得越权' },
+    { pattern: /\bsudo\b/, reason: '禁止提权' },
+    { pattern: /\bcurl\b[^\n]*?(?:\|\s*(?:ba)?sh|\s-o\s)/, reason: '禁止下载即执行 / 下载落盘' },
+  ];
+}
 
 /** shell 里「把内容写进文件」的写法 —— 命中后需再检查目标是否受保护。 */
 const REDIRECT_WRITE = /(?:(?:^|[;&|]\s*)[\w./-]+\s*)?(?:>>?|tee(?:\s+-a)?)\s*([^\s;|&>]+)/g;
@@ -154,11 +254,20 @@ function findRedirectTargetInProtected(command: string, repoRoot: string): strin
 /**
  * 判定一次工具调用是否放行 —— 围栏的唯一入口。
  *
- * @param toolName Claude Code 工具名，如 `Write` / `Edit` / `Bash`
- * @param input    该工具调用的入参（`PreToolUseHookInput.tool_input`）
- * @param repoRoot 目标仓库根绝对路径，用于把路径归一化
+ * @param toolName          Claude Code 工具名，如 `Write` / `Edit` / `Bash`
+ * @param input            该工具调用的入参（`PreToolUseHookInput.tool_input`）
+ * @param repoRoot          目标仓库根绝对路径，用于把路径归一化
+ * @param protectedBranches 受保护分支（会与 `DEFAULT_PROTECTED_BRANCHES` 取并集，
+ *                          见 `resolveProtectedBranches`）。缺省只用默认值。
+ *                          调用方应传入实际 base 分支（如 `GITHUB_BASE_BRANCH`），
+ *                          否则 base 不叫 main/master 时「禁直推 base」会静默失效。
  */
-export function guardToolCall(toolName: string, input: Record<string, unknown>, repoRoot: string): GuardDecision {
+export function guardToolCall(
+  toolName: string,
+  input: Record<string, unknown>,
+  repoRoot: string,
+  protectedBranches: readonly string[] = DEFAULT_PROTECTED_BRANCHES,
+): GuardDecision {
   // 0) 整工具级禁用(子 agent / 联网):与入参无关,直接拒
   const denyReason = DENY_TOOLS[toolName];
   if (denyReason) return { decision: 'deny', reason: denyReason };
@@ -183,7 +292,8 @@ export function guardToolCall(toolName: string, input: Record<string, unknown>, 
     const command = typeof input.command === 'string' ? input.command : '';
     if (!command) return { decision: 'allow' };
 
-    for (const { pattern, reason } of DANGEROUS_COMMANDS) {
+    // 惰性构建:危险命令表依赖受保护分支名,只在真正跑 Bash 时编译一次
+    for (const { pattern, reason } of buildDangerousCommands(resolveProtectedBranches(protectedBranches))) {
       if (pattern.test(command)) {
         return { decision: 'deny', reason: `${reason}｜命令：${command.slice(0, 120)}` };
       }

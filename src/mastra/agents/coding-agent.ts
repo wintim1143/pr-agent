@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { ClaudeSDKAgent } from '@mastra/claude';
 import type { HookCallback, SyncHookJSONOutput } from '@anthropic-ai/claude-agent-sdk';
 import { guardToolCall } from './guard.js';
+import { stage } from '../progress.js';
 
 /**
  * 真正写文件的编码执行体(封装 Claude Code CLI)。
@@ -148,6 +149,22 @@ function buildCodingEnv(): Record<string, string | undefined> {
 }
 
 /**
+ * 从环境读取「应当额外受保护的分支名」(通常是流水线的 base 分支)。
+ *
+ * 为什么不让 guard.ts 自己读 env:该模块刻意做成**纯函数**(不 IO、不读 env),
+ * 因此可被 jest 直接单测,也是唯一可被信任的拦截点。env 读取留在本层。
+ *
+ * 支持逗号分隔多值;空白项剔除。取不到时返回空数组 —— guard.ts 会退回默认值
+ * (`main`/`master`),即**最坏情况是退到原有保护范围,不会退到无保护**。
+ */
+export function resolveProtectedBranchNames(): string[] {
+  return (process.env.GITHUB_BASE_BRANCH ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+/**
  * 构造围栏用的 PreToolUse hook。
  *
  * 为什么必须走 hook 而不是 `canUseTool`:claude-agent-sdk 源码明确说明,
@@ -156,8 +173,10 @@ function buildCodingEnv(): Record<string, string | undefined> {
  *
  * 失败策略:**fail-closed** —— hook 自身异常时一律拒绝。
  * 理由:误拒会让流水线明显报错(可观测),误放行则是静默绕过(不可观测)。
+ *
+ * @param protectedBranches 额外受保护的分支(实际 base 分支)。与 guard 内部默认值取并集。
  */
-export function makeGuardHook(repoRoot: string): HookCallback {
+export function makeGuardHook(repoRoot: string, protectedBranches?: readonly string[]): HookCallback {
   return async input => {
     const deny = (reason: string): SyncHookJSONOutput => ({
       // 新版判定字段(SDK 推荐)
@@ -180,9 +199,16 @@ export function makeGuardHook(repoRoot: string): HookCallback {
       const toolName = String(hookInput.tool_name ?? '');
       const toolInput = (hookInput.tool_input ?? {}) as Record<string, unknown>;
 
-      const verdict = guardToolCall(toolName, toolInput, repoRoot);
+      const verdict = guardToolCall(toolName, toolInput, repoRoot, protectedBranches);
       if (verdict.decision === 'deny') {
         console.warn(`[permission-guard] deny ${toolName}: ${verdict.reason}`);
+        // 埋点(M3-6):红线生效必须留下**可追溯**证据。
+        // 只记工具名与原因摘要 —— 入参可能含凭据(`.env`、token),不进日志。
+        stage('guard:deny', {
+          stage: 'coding',
+          tool: toolName,
+          reason: verdict.reason.slice(0, 200),
+        });
         return deny(verdict.reason);
       }
       return {};
@@ -249,7 +275,10 @@ export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
       disallowedTools: ['WebFetch', 'WebSearch', 'Task', 'Agent'],
       hooks: {
         // 不设 matcher:按 SDK 官方示例,默认对全部工具生效
-        PreToolUse: [{ hooks: [makeGuardHook(repoRoot)] }],
+        // 第二个参数传「实际 base 分支」:围栏的「禁直推 base」不能写死 main/master,
+        // 否则 base 改名(如 M3 靶场用别的分支名)后这条红线会静默失效。详见 guard.ts。
+        // guard.ts 内部会与默认值取并集,传参只增不减。
+        PreToolUse: [{ hooks: [makeGuardHook(repoRoot, resolveProtectedBranchNames())] }],
       },
       // 无人值守的成本与失控上限(可被 env 覆盖)
       maxTurns: Number(process.env.CODING_MAX_TURNS ?? 30),

@@ -298,27 +298,163 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
   - 注：node 的 `fetch` 是**直连**（Node 24 默认不读 `HTTPS_PROXY`，实测 `NODE_USE_ENV_PROXY` 未设置），
     这解释了「REST 一直好用、git 一直不好用」的分裂现象
 
-### M3-4 notify 真推飞书卡片
+### M3-4 notify 真推飞书卡片 ✅ **已完成（2026-09-15）**
 - 内容：`buildDevCompleteCard` 补上真实 PR 链接；卡片文案与「按钮回调不可用」的现状一致（避免误导用户去点无效按钮）
 - 验收：飞书群收到卡片；`feishuNotify` 返回 `ok:true`
 
-### M3-5 merge 人工关卡（核心）
+#### 实测
+`notify` 步在三轮跑批里均成功（`step:done mode=app`，约 1.1~1.5s），飞书自建应用模式链路通畅。
+**AC-7 仍需人工去飞书群确认**（脚本只能证明推送调用成功，证明不了「群里真的显示了」）。
+
+#### 实际改动（比原计划多一处）
+| 改动 | 说明 |
+|---|---|
+| `ContextSchema` 新增 `prUrl` | 原先上下文里只有 `prNumber`，卡片就只能显示光秃秃的 `#1` |
+| `push-open-pr` 步回填 `prUrl: res.prUrl ?? undefined` | `PushPrResult.prUrl` 是 `string \| null`，而 schema 是 `z.string().optional()` **不接受 null** —— 直接透传会让 zod 校验失败 |
+| `buildDevCompleteCard` 渲染 `[#3](url)` | 拿不到链接时**显式说明**「未拿到链接，请到仓库 Pull requests 查看」，而不是静默只显示号 |
+| 卡片文案 | 改为 **「⚠️ 卡片按钮的回调尚未接入（需 IM 入口），当前点击无效；合并不由卡片按钮驱动，请人工确认后执行 resume」** —— 原文案「按钮回调需 IM 入口，后续接入」容易被读成「能用但还在做」 |
+
+### M3-5 merge 人工关卡（核心）✅ **已完成（2026-09-15）——M3 最高风险项解除**
 - 内容：`suspend({waitingFor:'merge-approval'})` → 验证 `status=suspended` → 外部 `resume({approved:true})` → REST squash merge。**同时验证 resume 后上下文未丢**（能拿到 `prNumber` / `branch` 等字段）
 - 验收：① 未 resume 时 run 停在 suspended；② `resume({approved:false})` 时**不合并**、PR 保持 open；③ `resume({approved:true})` 后 PR `merged=true`、base 分支出现 squash commit
 - ⚠️ **M2 从未验证过 dev-workflow 的 suspend/resume** —— 这是 M3 风险最高的一项，建议单独先跑通再合进端到端
 
-### M3-6 红线扩展到远端维度
+#### 实测（全部通过 · 每一条都跑了独立进程）
+| run | 动作 | 结果 |
+|---|---|---|
+| `d5a53a0a…` | `resume({approved:false})` | ✅ PR **#2** `state=open` / `merged=false`；main `b17e66b → b17e66b` **未变**；耗时 4.3s |
+| `1a670d74…` | `resume({approved:true})` | ✅ PR **#3** `state=closed` / `merged=true`；main `b17e66b → e2d1ee7` **已变**；squash sha `e2d1ee77…`；耗时 8.2s |
+
+**上下文未丢**（两项都验到）：跨进程 resume 后 merge 步仍能读到
+`prNumber` / `branch` / `issueTitle` / `testResult` / `reviewResult` / `commitResult` ——
+这些字段**只可能来自 LibSQLStore**，进程内不存在任何变量。
+
+#### 🔑 关键方法学：必须「跨进程」才验得到持久化
+M1 的 `insight-workflow` 也验过 suspend/resume，但那是**同进程**的：`createRun()` 与 `run.resume()`
+写在同一个脚本里，变量还在内存里 —— 等于没验持久化。本次刻意把 resume 拆成**独立的一次进程调用**
+（`--resume-deny` / `--resume-approve` 各自起进程），复现「进程内变量全丢」，这才验到了 LibSQLStore 那一环。
+→ 脚本 `resumeLoop()` 里对此有详细注释，勿改回同进程。
+
+#### 实际改动：merge 步的「三态」语义（原实现有个永不消失的挂起）
+原实现是 `if (!resumeData || !approved) suspend()` —— 于是**「明确拒绝」与「还没表态」走了同一条路**：
+用户点「❌ 拒绝」→ 又挂起一次 → 卡片再次出现 → 再点再出现，**一个永远点不掉的循环**
+（与 M3-3 踩的「push 失败仍走到 suspend」是同一类坑）。现拆成三态：
+
+| `resumeData` | 语义 | 动作 | run 状态 |
+|---|---|---|---|
+| 从未 resume | 还没人看 | `suspend()` | `suspended` |
+| `{approved:true}` | 批准 | 真 squash merge | `success` |
+| `{approved:false}` | **明确拒绝** | 终止，PR 保持 open | `success` |
+
+拒绝时 run 记 `success` 而非 `failed`：**「拒绝」是合法的人工决策，不是流水线故障** ——
+记成失败会污染「哪些 run 真的坏了」这一判断。同时**刻意不关 PR**：关闭是另一个不可逆动作，
+且「拒绝合并」与「废弃这个 PR」不是同一件事，留 open 让人自己决定。
+
+### M3-6 红线扩展到远端维度 ✅ **已完成（2026-09-15）**
 - 内容：把「禁 force push / 禁直推 base / 禁改远端默认分支」纳入 `guard.ts` 的危险命令表（若已有则补单测），并端到端验证一次
 - 验收：红线单测全绿；端到端跑一次 `--redline` 类场景，deny 日志出现且远端未受影响
 
-### M3-7 端到端验证脚本 + AC 矩阵回填
+#### 原表的两类漏洞（读码发现，都不报错、只是静默放行）
+| 漏洞 | 具体形态 |
+|---|---|
+| **远端破坏性操作整片缺失** | `--mirror`（全 ref 同步）、`--prune`（删远端有而本地无的分支）、`-d`/`--delete`、空 refspec `git push origin :branch`、`git remote set-url\|rename\|remove\|set-head`、`gh repo edit --default-branch` —— 原表**一条都没有** |
+| **force push 只认孤立 `-f`** | 原正则 `\s(?:-f\|--force)\b` 漏掉短选项组合 `git push -uf origin x` |
+| **base 分支名写死** | 原正则硬编码 `(?:main\|master)`。而 base 由 `GITHUB_BASE_BRANCH` 决定 —— **改名后这条红线静默失效**（不报错、不告警，只是不再拦） |
+
+#### 顺带修掉一个真实误拦
+原实现用 `\bmain\b` 全文匹配 → `git push origin feat/add-main-section` 里分支名嵌了 `main`，
+`-` 是词边界 → **正常推自己的分支被拦**。现改为**只认 refspec 位置上的分支名**
+（要求 base 名前面是空白、可带 `+` 与 `src:`、可带 `refs/heads/`，后面是空白或行尾），
+于是 `feat/add-main-section`（前缀 `-`）、`feature/main`（前缀 `/`）都不再命中。
+
+#### 实际改动
+| 文件 | 改动 |
+|---|---|
+| `guard.ts` | 新增 `DEFAULT_PROTECTED_BRANCHES` / `resolveProtectedBranches()`（**只增不减**：传入项与默认值取并集，不可能靠传参把 main/master 移出保护）；`DANGEROUS_COMMANDS` 常量改为 `buildDangerousCommands(protectedBranches)`；新增 6 条远端维度规则 + 动态 `pushProtected` 正则（分支名经 `escapeRegExp` 转义，`release/1.0` 不会当通配）；`guardToolCall()` 加第 4 个可选参数 |
+| `coding-agent.ts` | 新增 `resolveProtectedBranchNames()` 从 `GITHUB_BASE_BRANCH` 读实际 base；`makeGuardHook(repoRoot, protectedBranches?)` |
+| `progress.ts` | 新增事件类型 **`guard:deny`** |
+| `coding-agent.ts` | deny 分支加 `stage('guard:deny', …)` 埋点 |
+
+#### 🔑 为什么给 deny 加埋点（原有实现的可观测性缺口）
+原来 guard 拦下一次调用只打 `console.warn` —— **终端输出会随会话消失**，「红线确实生效了」
+这件事事后**无法从任何持久化文件证明**。而 M3-6 的验收恰恰要求「deny 日志出现」。
+现每次拦截落一条结构化事件到 `logs/dev-workflow.log`。只记工具名与原因摘要，**不记入参**
+（入参可能含 `.env`、token 等凭据）。
+
+#### 实测
+- **单测 95 条全绿**（原 57 + 新增 38）：「新红线」18 条 deny + 「不得误拦」12 条 allow + 动态注入/只增不减 8 条
+- **端到端**（`--gate-negative`，见 M3-8）：`guard:deny` 埋点 **2 条**，内容
+  `Edit: 受保护路径禁止写入：agent.md（自举期 agent 不得改动流水线自身）`；
+  靶场工作树**逐字节未变**、远端 heads **未变**、coding agent 自述「被 permission guard 当场拒绝」
+- 端到端刻意用「受保护路径」而非「远端 force push」构造：后者需要 agent 主动执行危险命令，
+  不可控且若真跑出去就已是事故。**红线端到端验证本身不能引入红线风险**。
+
+### M3-7 端到端验证脚本 + AC 矩阵回填 ✅ **已完成（2026-09-15）**
 - 内容：`scripts/verify-pr-loop.js`：前置检查（靶场就绪 / 工作区干净 / token 有写权限）→ 跑 workflow 到 suspend → 自动 resume → 逐条打印 AC 判定。证据落 `logs/m3-verify.log`
 - 验收：脚本可重复运行；AC-1~AC-9 全部有可判定输出
 
-### M3-8 吸收 M2 遗留②：`request-changes` 后不再 commit
+#### 脚本能力（4 种模式）
+| 模式 | 作用 |
+|---|---|
+| （默认） | 前置检查 6 段：硬设 5 env / 靶场就绪 / remote 双向核对 / 身份反证 / token 写探针 / 汇总 |
+| `--run` | 完整八步，真 push、真开 PR，止于 `suspended`，打印 runId |
+| `--resume-deny <runId>` | **独立进程** resume 拒绝 → 验 AC-5 |
+| `--resume-approve <runId>` | **独立进程** resume 批准 → 验 AC-6 |
+| `--gate-negative` | 负向场景：预期失败，验「闸门判负 → 无 commit / 无 push」 |
+| `--clean-remote` / `--reset` / `--skip-probe` | 清远端 / 清本地 / 跳过探针 |
+
+#### 两个在设计上刻意做的取舍
+1. **resume 模式不做前置检查**：它的验证对象是「上一轮留下的 suspended run」，
+   若先跑 `--reset`/`--clean-remote` 会把证据清掉。故 resume 在 main 里**独立分流**，早于前置检查。
+2. **脚本侧独立实现 `parseRemoteUrl()` 做交叉核对**，不复用 `parseOwnerRepo()` ——
+   避免「用被测对象验证被测对象」的自证循环。
+
+#### 踩坑与修复（都写在脚本注释里）
+- **`--gate-negative` 一开始被 `if (!RUN)` 挡在前置检查**，只跑检查就退出 → 条件改为 `if (!RUN && !GATE_NEGATIVE)`
+- **「HEAD sha 变没变」不能当「有没有 commit」的判据**：checkout 会把 HEAD 从上一轮分支切到
+  「从 base 新建的分支」，sha 必然变化（实测 `42b313a(feat/3) → b17e66b(新分支)` 被误判成「产生了 commit」）。
+  改用「领先 base 的提交数 = 0」+「本地 base 未移动」
+- **改函数签名漏改调用点**：`judgeGateNegative` 加了 `baseLocalBefore` 参数却没更新调用处 →
+  函数内是 `undefined` → 比较恒 false → 报出一条**并不存在**的失败。已修，并加了内部告警
+  （`if (!baseLocalBefore) log('⚠️ …调用方漏传?')`）防止同类静默失真
+
+#### AC 回填
+见 §8 表格「实测」列（AC-1~AC-9 全部有实测值或明确标注未覆盖项）。
+
+### M3-8 吸收 M2 遗留②：`request-changes` 后不再 commit ✅ **已完成（2026-09-15）**
 - 内容：当前 `test` / `review` 步判负后，流程**仍会继续走 commit**（代码里是 TODO，条件边未实现）。M3 起 commit 会被 push 到远端，误判代价升高 → 应实现「判负则终止（或回退 coding）」的条件边
 - 验收：构造一个 review 必判 `request-changes` 的场景，验证**没有 commit、没有 push**（而非「commit 了但没人看」）
 - 📌 若本轮只做「终止」不做「回退重做」，需在卡里写清这是有意为之的一半（回退涉及循环/次数上限，成本高）
+
+#### ⚠️ 计划中的 `branch` 条件边**经实测被否决**（这是本里程碑最有价值的一条否证）
+卡里原设想用 Mastra 的 `.branch()` 做条件边。动手前先写了两个一次性实验
+（`.tmp/branch-probe.js` / `.tmp/branch-probe2.js`，`@mastra/core@1.63.2`）探运行时语义，
+三条事实**全部与设想相反**：
+
+| 实验发现 | 后果 |
+|---|---|
+| 多条条件**不互斥**，而是「谁为真谁执行」。兜底的 `async () => true` 让 `b-pass` 与 `b-other` **在同一次运行里都执行了** | **没有 else 语义**，无法表达「二选一」 |
+| branch 之后链接的 `.then(step)` 收到的 inputData 是**聚合对象** `{'b-pass':{…},'b-other':{…}}`，不再是上一步输出 | 与本文件「八步共用同一 `ContextSchema`」直接冲突；`inputData.prNumber` 全部读不到 |
+| 分支内 step 抛错 → run `status=failed`，后续步骤不执行 | **终止本来就该用 throw** |
+
+→ 结论：**闸门判负的终止用「step 内显式 throw」表达**，语义等价（后续一律不执行）且是 fail-closed。
+实验脚本在 `.tmp/`（已被 gitignore），故结论**必须写在这里**，否则下次又会有人去试。
+
+#### 有意只做「终止」的一半
+**不做「回退 coding 重做」**：回退需要循环（`.dowhile()`）+ 次数上限 + 失败累积策略 + 防死循环，
+属独立工作量，M3 范围外。这是**有意为之的一半**，不是漏做。
+
+#### 实测（`--gate-negative`，4/4 通过）
+构造：issue 要求改**受保护文件** `agent.md` → `guard` 拦下每次写入 → 工作树无 diff → test 闸门判负。
+| 判据 | 结果 |
+|---|---|
+| 错误含 `GATE_REJECTED` | ✅ `GATE_REJECTED@test: 测试闸门判负,终止流水线(不进入 review/commit/push)` |
+| 没有产生 commit | ✅ 领先 base 的提交数 = 0，本地 base 未移动 |
+| 靶场工作树无残留 | ✅ 干净（受保护路径写入确实被拒，未留残留） |
+| 远端未被写 | ✅ heads 运行前后均 4 条、逐字未变；`push-open-pr` 步**未执行** |
+
+**这个构造一举两得**：同时验证了 M3-6（红线在真实链路生效，`guard:deny` 埋点 2 条）
+与 M3-8（判负即终止）。且本次是 **test 闸门**判负 —— review 那条路径共用同一实现，未单独构造。
 
 ---
 
@@ -327,19 +463,26 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
 > 定义期先列预期判据，实施到对应阶段再按实际端点 / 字段校准。
 > **验证方式列是强制的**：写清「由哪个脚本 / 手工动作判定，证据落在哪个文件」。
 
-| # | 验收项 | 判据 | 验证方式 · 证据位置 | 实测（M3-3） |
+| # | 验收项 | 判据 | 验证方式 · 证据位置 | 实测（2026-09-15 · M3 收口） |
 |---|---|---|---|---|
-| AC-1 | feature 分支真推到远端 | `git ls-remote origin feat/<n>-<slug>` 有输出 | `verify-pr-loop.js` 打印；证据 `logs/m3-verify.log` | ✅ `a07bb2f… refs/heads/feat/1-add-install-section` |
-| AC-2 | PR 真开 | REST 返回 `number` + `html_url`；网页可见，状态 open | 脚本打印 + **人工去 GitHub 看** | ✅ **PR #1** open（脚本自动核对） |
-| AC-3 | PR 内容正确 | `head` = feature 分支、`base` = main、body 含 test/review 结论 | REST 查询 + 人工看 PR 描述 | ✅ head `feat/1-add-install-section` → base `main`；body 含完整 **测试/审核/commit** 三段结论（`+7/-0`，1 文件） |
-| AC-4 | merge 关卡真挂起 | run `status = suspended`、`waitingFor = merge-approval`；此时 PR **仍 open** | 脚本打印 + `GET /api/workflows/dev-workflow/runs/<id>` | ✅ `status=suspended`，PR 同时保持 open |
-| AC-5 | 未批准不合并 | `resume({approved:false})` 后 PR 保持 open、base 分支 sha 未变 | 脚本打印 + 人工核对 |
-| AC-6 | 批准后真 merge | `resume({approved:true})` 后 PR `state=closed` / `merged=true`；base 分支出现 squash commit | REST 查询 + **人工去 GitHub 看 Merged 标记** |
-| AC-7 | 飞书卡片真推送 | 群里收到卡片；`feishuNotify` 返回 `ok:true` | **人工去飞书群看** + 脚本打印 |
-| AC-8 | 红线（远端维度） | `git push --force` / 直推 base → `deny` | 单测 + 端到端；日志含 `[permission-guard] deny` |
-| AC-9 | pr-agent 工作树未被触碰 | 运行前后 `git status --short` 一致、无新增分支 | 脚本打印快照对比 |
+| AC-1 | feature 分支真推到远端 | `git ls-remote origin feat/<n>-<slug>` 有输出 | `verify-pr-loop.js` 打印；证据 `logs/m3-verify.log` | ✅ 三轮均成功：`feat/1-add-install-section@a07bb2f`、`feat/2-add-quickstart-section@1de6dd5`、`feat/3-add-contributing-section@42b313a` |
+| AC-2 | PR 真开 | REST 返回 `number` + `html_url`；网页可见，状态 open | 脚本打印 + **人工去 GitHub 看** | ✅ PR **#2**（open）、PR **#3**（open → merged）。脚本自动核对 REST 返回，网页可见 |
+| AC-3 | PR 内容正确 | `head` = feature 分支、`base` = main、body 含 test/review 结论 | REST 查询 + 人工看 PR 描述 | ✅ PR #2：`head=feat/2-…` → `base=main`，`+10/-0`，body 含 **测试/审核/commit** 三段完整结论（测试报告还主动列出「非阻塞遗留确认项」——证明模型确实在读 diff） |
+| AC-4 | merge 关卡真挂起 | run `status = suspended`、`waitingFor = merge-approval`；此时 PR **仍 open** | 脚本打印 + `GET /api/workflows/dev-workflow/runs/<id>` | ✅ 三个 run 均如此；跨进程读 storage 得 `status=suspended`、`suspendedPaths={"merge":[7]}`，PR 同时保持 open |
+| AC-5 | 未批准不合并 | `resume({approved:false})` 后 PR 保持 open、base 分支 sha 未变 | 脚本打印 + 人工核对 | ✅ run `d5a53a0a…` → PR #2 `state=open` / `merged=false`；main `b17e66b → b17e66b` **未变**（另 run `9bfc3dc3…` 亦同，PR #1 保持 open） |
+| AC-6 | 批准后真 merge | `resume({approved:true})` 后 PR `state=closed` / `merged=true`；base 分支出现 squash commit | REST 查询 + **人工去 GitHub 看 Merged 标记** | ✅ run `1a670d74…` → PR #3 `state=closed` / `merged=true`；main `b17e66b → e2d1ee7`；squash sha `e2d1ee77…`，main 最新提交 = `Merge pull request #3` |
+| AC-7 | 飞书卡片真推送 | 群里收到卡片；`feishuNotify` 返回 `ok:true` | **人工去飞书群看** + 脚本打印 | ⚠️ **半验**：`notify` 步三轮均 `step:done mode=app`（1.1~1.5s，应用模式链路通畅），**但「群内是否真的显示」脚本证不了，需人工确认** |
+| AC-8 | 红线（远端维度） | `git push --force` / 直推 base → `deny` | 单测 + 端到端；日志含 `[permission-guard] deny` | ✅ 单测 **95 条**（新增 38：远端红线 18 deny + 不得误拦 12 allow + 动态注入 8）；端到端 `guard:deny` 埋点 **4 条**，agent 换了 `Edit` 与 `Write` 两种途径**都被拦**，远端 heads 未受影响 |
+| AC-9 | pr-agent 工作树未被触碰 | 运行前后 `git status --short` 一致、无新增分支 | 脚本打印快照对比 | ✅ `--gate-negative` 实测：`工作树一致 / 本地分支无新增`（`logs/` `mastra.db` `dist/` `.tmp/` 均已 gitignore，跑批不污染 status） |
 
 > **AC-4/5 是本里程碑的核心价值**：它们验证的不是「能不能合并」，而是「**不该合并的时候合不了**」。这两条不过，自动开发就不该被允许接触任何真实业务仓库。
+
+> **AC-5 / AC-6 的方法学要点**：两次 resume 都是**独立进程**调用（`--resume-deny` / `--resume-approve`），
+> 而不是在跑 `--run` 的同一个进程里接续 —— 同进程 resume 时变量还在内存里，**验不出 LibSQLStore 的持久化**。
+> 详见 §7 M3-5 的「关键方法学」小节。
+
+> **AC-7 是九条里唯一没有闭环的**：它是**唯一必须以人为观测点**的一条（「群里收到卡片」）。
+> 脚本侧能证明的极限是「推送调用返回成功」，剩下一步需要人去飞书群看一眼。
 
 ---
 
@@ -612,3 +755,67 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
   - ⬜ **M3-6**：红线扩展到远端维度（禁 force push / 禁推 base）
   - ⬜ **M3-8**：`request-changes` 后不再 commit 的条件边
   - ⬜ 本轮改动**未提交**（等用户指令）
+
+---
+
+### 2026-09-15 · M3-4 ~ M3-8 收口 ✅（M3 八项全部完成）
+
+**执行顺序**：先改行为（零外部动作）→ 再跑真实验证（含不可逆动作为最后）→ 最后收口。
+即 **M3-8 → M3-6 → M3-4 → M3-5 → M3-7**。
+好处：等走到「真写远端」那一步时，代码已经是最终形态 —— 一次跑批就能同时覆盖多条 AC。
+
+#### 本轮最重要的一条结论：`branch` 条件边**被实测否决**
+
+详见 §7 M3-8。这里只留教训：
+
+> **把「文档/类型说可以这么做」与「运行时会这么发生」分开验证。**
+> `.branch()` 的 API 存在、类型也能编译通过，但运行时语义与设想**完全相反**
+> （多条件不互斥 + 分支后 inputData 变聚合对象）。
+> 花在 `.tmp/branch-probe*.js` 上的两次实验（约 10 分钟）省下的是一次**错误的架构改造**。
+
+#### 执行记录（时间正序）
+
+| 时刻 | 动作 | 结果 |
+|---|---|---|
+| 15:46 | M3-8 + M3-6 + M3-4 改完，编译 + 全量单测 | ✅ 137/137（原 99 + guard 新增 38） |
+| 15:48 | **跨进程探针**：对 M3-3 遗留的 suspended run 调 `resume({approved:false})` | ✅ 上下文完整恢复（prNumber/branch/test/review/commit 全在）→ **M3 最高风险项提前解除** |
+| 15:49 | 前置检查（默认模式） | ✅ 六段全绿，1.5s |
+| 15:51 | `--run`（issue #2） | ✅ 3/3；PR **#2**；runId `d5a53a0a…`；飞书 `mode=app` |
+| 15:51 | `--resume-deny d5a53a0a…`（**独立进程**） | ✅ 3/3；PR #2 保持 open；main 未变 |
+| 15:58 | `--run`（issue #3） | ✅ 3/3；PR **#3**；runId `1a670d74…` |
+| 15:59 | `--resume-approve 1a670d74…`（**独立进程**） | ✅ 3/3；**PR #3 真合并**；main `b17e66b → e2d1ee7` |
+| 16:00 | `--gate-negative`（首跑） | 🟡 2/3：闸门已生效，但「无 commit」判据写错（把 checkout 切分支误判成 commit） |
+| 16:04 | 修判据 + 加 `guard:deny` 埋点后重跑 | ✅ 4/4 |
+| 16:08 | 加 AC-9 判定后重跑 | ✅ **5/5**；`guard:deny` **4 条**（Edit / Write 两种途径都被拦） |
+
+#### 改动清单（本轮累计）
+
+| 文件 | 改动 |
+|---|---|
+| `workflows/dev-workflow.ts` | ① test/review 判负 → 显式 `throw` 终止（M3-8）；② `ContextSchema` 加 `prUrl`；③ merge 步**三态语义**（拒绝即终止）；④ 注释写清 branch 实测结论 |
+| `agents/guard.ts` | 远端维度 6 条新规则 + 动态 `protectedBranches`（**只增不减**）+ 修「分支名嵌 main 被误拦」 |
+| `agents/coding-agent.ts` | `resolveProtectedBranchNames()`；`makeGuardHook` 加参；deny 分支加 `guard:deny` 埋点 |
+| `progress.ts` | 新增事件类型 `guard:deny` |
+| `adapters/feishu.ts` | 卡片渲染 PR 链接；文案改为「按钮当前点击无效」 |
+| `test/mastra/guard.test.ts` | +38 条（新红线 18 deny / 不得误拦 12 allow / 动态注入与只增不减 8） |
+| `scripts/verify-pr-loop.js` | +`--resume-approve` / `--resume-deny` / `--gate-negative` / AC-9 判定；issue 可 env 覆盖 |
+
+#### 三个自己踩的坑（都已写进代码注释）
+
+1. **`branch` 语义假设错误** —— 见上。
+2. **「HEAD sha 变没变」≠「有没有 commit」**：checkout 会把 HEAD 从上一轮分支切到
+   「从 base 新建的分支」，sha 必然变化（实测 `42b313a(feat/3) → b17e66b(新分支)` 被误判为产生了 commit）。
+   改用「**领先 base 的提交数 = 0**」+「本地 base 未移动」。
+3. **改函数签名漏改调用点**：`judgeGateNegative` 加了 `baseLocalBefore` 参数却**没更新调用处**
+   → 函数内是 `undefined` → 比较恒 false → **报出一条并不存在的失败**。
+   这是「静默失真」的典型：报告说有问题、实际没问题，**方向恰好相反**。
+   已加内部告警（`if (!baseLocalBefore) log('⚠️ …调用方漏传?')`）。
+
+#### 遗留 / 待人工
+
+- ⚠️ **AC-7 需人工去飞书群确认** —— 脚本能证明的极限是「推送调用返回成功」
+- ⬜ **AC-6 的 Merged 标记建议人工去 GitHub 看一眼**：<https://github.com/wintim1143/pr-agent-e2e/pull/3>
+- ⬜ **远端清理未做**：PR #1 / #2 仍 open，远端 `feat/1-*`、`feat/2-*`、`feat/3-*` 分支仍在。
+  清理命令 `node scripts/verify-pr-loop.js --clean-remote`
+  —— **故意没自动跑**：PR #1/#2 是 AC-5 的证据载体，先留着让人看过再清
+- ⬜ 遗留项（M4 再议）：P0-2 `runGate` 盲重试、P2-5 AC-7 证据串误导

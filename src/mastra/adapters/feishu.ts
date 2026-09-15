@@ -137,13 +137,26 @@ export function buildDevCompleteCard(ctx: {
   issueTitle: string;
   branch?: string;
   prNumber?: number;
+  /** PR 的网页链接。有值时渲染成可点链接（M3-4 补） */
+  prUrl?: string;
 }): FeishuNotifyInput {
+  // PR 行(M3-4):原先只显示 `#1`,拿到的人无法一键跳转,得自己去仓库里翻。
+  // 有链接渲染成 `[#1](url)`;拿不到链接时**显式说明**而不是静默只显示号 ——
+  // 「有 PR 号但没链接」本身是个可观测的状态,不该被藏起来。
+  const prLine =
+    typeof ctx.prNumber === 'number' && ctx.prNumber > 0
+      ? ctx.prUrl
+        ? `**PR**: [#${ctx.prNumber}](${ctx.prUrl})`
+        : `**PR**: #${ctx.prNumber}（未拿到链接，请到仓库 Pull requests 查看）`
+      : '';
   const lines = [
     `**需求**: #${ctx.issueNumber} ${ctx.issueTitle}`,
     ctx.branch ? `**分支**: \`${ctx.branch}\`` : '',
-    typeof ctx.prNumber === 'number' && ctx.prNumber > 0 ? `**PR**: #${ctx.prNumber}` : '',
+    prLine,
     '',
-    '请在飞书卡片上点 **🔀 合并** 或 **❌ 拒绝**(按钮回调需 IM 入口,后续接入)。',
+    // ⚠️ 文案与「按钮回调尚未接入」的现状对齐(M3-4):卡片上的按钮本轮点击**无效**,
+    // 合并由人工确认后 resume 触发。不写清楚会让人以为点按钮就能合并,白等一场。
+    '⚠️ 卡片按钮的回调尚未接入(需 IM 入口),**当前点击无效**;合并不由卡片按钮驱动,请人工确认后执行 resume。',
   ]
     .filter(Boolean)
     .join('\n\n');
