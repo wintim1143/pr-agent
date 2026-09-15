@@ -1,6 +1,11 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   getGithubConfig,
   githubMergePR,
+  parseOwnerRepo,
 } from '../../src/mastra/adapters/github';
 
 /** mock 全局 fetch:返回指定响应;记录最后一次调用以便断言请求参数 */
@@ -26,6 +31,9 @@ beforeAll(() => {
     'GITHUB_OWNER',
     'GITHUB_REPO',
     'GITHUB_BASE_BRANCH',
+    // 2026-09-15 补: parseOwnerRepo 现在按 repoRoot() 解析,而 repoRoot() 读这个 env,
+    // 不纳入恢复会让本文件的用例互相污染(并可能影响其他测试文件)。
+    'CODING_REPO_ROOT',
   ];
   for (const k of keys) BASE_ENV[k] = process.env[k];
 });
@@ -105,5 +113,86 @@ describe('githubMergePR', () => {
     } finally {
       m.restore();
     }
+  });
+});
+
+/**
+ * `parseOwnerRepo` 的 cwd 语义 —— M3-2 的**回归测试**。
+ *
+ * ## 为什么这些用例必须存在（这是一条静默 bug，不是理论风险）
+ * 原实现执行 `git remote get-url origin` 时**未指定 cwd** → git 落在**进程工作目录**上。
+ * 跑 workflow 时进程 cwd 是 pr-agent 自己 → 恒解析出 `wintim1143/pr-agent`。
+ * 后果：`push` 走 `repoRoot()`（= CODING_REPO_ROOT，靶场），而 owner/repo 来自进程 cwd（pr-agent）
+ * → **分支推到靶场、PR 开到 pr-agent 身上**。全程不报错、不崩溃，只是把 PR 开在错的仓库上。
+ *
+ * 下面「【回归】」那一条就是这条 bug 的锁：它必须解析出 `CODING_REPO_ROOT` 指向的仓库，
+ * 而**不是**进程 cwd 的仓库。这一条挂了就说明 bug 复现了。
+ */
+describe('parseOwnerRepo（cwd 语义 · M3-2 回归）', () => {
+  const cleanup: string[] = [];
+
+  /** 造一个临时 git 仓库；remoteUrl 非空时给它加 origin */
+  function makeRepo(remoteUrl?: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-agent-owner-'));
+    cleanup.push(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
+    if (remoteUrl) {
+      execFileSync('git', ['remote', 'add', 'origin', remoteUrl], { cwd: dir, stdio: 'pipe' });
+    }
+    return dir;
+  }
+
+  afterEach(() => {
+    while (cleanup.length) {
+      try {
+        rmSync(cleanup.pop()!, { recursive: true, force: true });
+      } catch {
+        /* Windows 偶发文件锁,忽略 —— 是临时目录,不影响判定 */
+      }
+    }
+  });
+
+  it('HTTPS remote(带 .git 后缀)→ 正确解析且剥掉后缀', () => {
+    const dir = makeRepo('https://github.com/wintim1143/pr-agent-e2e.git');
+    expect(parseOwnerRepo(dir)).toEqual({ owner: 'wintim1143', repo: 'pr-agent-e2e' });
+  });
+
+  it('SSH remote(git@host:owner/repo.git)→ 正确解析', () => {
+    const dir = makeRepo('git@github.com:wintim1143/pr-agent-e2e.git');
+    expect(parseOwnerRepo(dir)).toEqual({ owner: 'wintim1143', repo: 'pr-agent-e2e' });
+  });
+
+  it('无 origin remote → null(不抛错)', () => {
+    expect(parseOwnerRepo(makeRepo())).toBeNull();
+  });
+
+  it('cwd 指向不存在的目录 → null(不抛错)', () => {
+    const ghost = join(tmpdir(), `pr-agent-ghost-${Date.now()}`);
+    expect(() => parseOwnerRepo(ghost)).not.toThrow();
+    expect(parseOwnerRepo(ghost)).toBeNull();
+  });
+
+  // ⬇️ 回归锁：这一条挂了就说明「PR 开到 pr-agent 身上」的 bug 复现了
+  it('【回归】不传 cwd 时按 CODING_REPO_ROOT 解析,绝不能落到进程 cwd(pr-agent)', () => {
+    process.env.CODING_REPO_ROOT = makeRepo('https://github.com/wintim1143/pr-agent-e2e.git');
+
+    const r = parseOwnerRepo();
+    expect(r).toEqual({ owner: 'wintim1143', repo: 'pr-agent-e2e' });
+    // 显式负向断言：修复前这里会是 pr-agent（进程 cwd 的 remote）
+    expect(r?.repo).not.toBe('pr-agent');
+  });
+
+  it('CODING_REPO_ROOT 指向不存在目录 → null(repoRoot() 的抛错不逃逸出本函数)', () => {
+    process.env.CODING_REPO_ROOT = join(tmpdir(), `pr-agent-nope-${Date.now()}`);
+    expect(() => parseOwnerRepo()).not.toThrow();
+    expect(parseOwnerRepo()).toBeNull();
+  });
+
+  it('显式 env 优先于 remote 解析', () => {
+    process.env.CODING_REPO_ROOT = makeRepo('https://github.com/wintim1143/pr-agent-e2e.git');
+    process.env.GITHUB_TOKEN = 't';
+    process.env.GITHUB_OWNER = 'someone-else';
+    process.env.GITHUB_REPO = 'other-repo';
+    expect(getGithubConfig()).toMatchObject({ owner: 'someone-else', repo: 'other-repo' });
   });
 });

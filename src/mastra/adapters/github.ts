@@ -7,7 +7,8 @@
  *   1. `git push` —— 用显式 `GITHUB_TOKEN` 内嵌 HTTPS URL 推分支(CI 标准做法,不依赖 SSH/gh);
  *   2. 开 PR / merge —— **全部走 GitHub REST API**(`fetch`),**不依赖 `gh` CLI**(K5 决策:macOS 无
  *      Homebrew、不引入外部二进制,统一 REST 保证跨平台行为一致)。
- * - owner/repo 优先读 `GITHUB_OWNER`/`GITHUB_REPO`,留空则自动从 `git remote get-url origin` 解析。
+ * - owner/repo 优先读 `GITHUB_OWNER`/`GITHUB_REPO`,留空则从**目标仓库**(`repoRoot()`)的
+ *   `git remote get-url origin` 解析 —— 注意是 repoRoot 而非进程 cwd(见 `parseOwnerRepo` 注释)。
  * - `GITHUB_TOKEN` 是唯一鉴权来源(fine-grained PAT,需 Contents + Pull requests 写权限)。
  *
  * 重要:本模块**加载时不抛错**(否则拖垮 `npm test` 与 `GET /api/agents` 仅列元数据的场景),
@@ -79,17 +80,38 @@ function repoRoot(): string {
   }).trim();
 }
 
-/** 从 git remote 解析 owner/repo(支持 SSH 与 HTTPS 两种 remote URL) */
-function parseOwnerRepo(): { owner: string; repo: string } | null {
+/**
+ * 从 git remote 解析 owner/repo(支持 SSH 与 HTTPS 两种 remote URL)。
+ *
+ * ## 为什么必须显式指定 cwd(2026-09-15 修 · M3-2)
+ * 原实现执行 `git remote get-url origin` **未指定 cwd** → git 落在**进程工作目录**上,
+ * 而本进程的 cwd 是 pr-agent 自身 → 恒解析出 `wintim1143/pr-agent`。
+ * 后果是「push 走 `repoRoot()`(指向靶场)、PR 却开到 pr-agent 身上」这种错位:
+ * push 与 owner/repo 来自**两个不同的仓库**,且不看代码根本发现不了。
+ * M2 零远端时无感,但 M3 起会真写远端,这个错位不可接受。
+ *
+ * 现在与 `repoRoot()` **同源**:cwd 显式指定为目标仓库,消除隐式依赖。
+ * 未配置 `CODING_REPO_ROOT` 时 `repoRoot()` 回退到「进程 cwd 的 git 顶层」,
+ * 与原行为等价(向后兼容既有调用方)。
+ *
+ * @param cwd 解析用的工作目录;省略时取 `repoRoot()`
+ * @returns 解析出的 owner/repo;无 remote、非 git 仓库或 `repoRoot()` 抛错时返回 null
+ */
+export function parseOwnerRepo(cwd?: string): { owner: string; repo: string } | null {
   try {
+    // `repoRoot()` 可能抛错(CODING_REPO_ROOT 目录不存在 / 不是 git 仓库),
+    // 故必须在 try 内调用 —— 否则异常会逃逸出本函数,
+    // 把「解析不出 owner/repo」这种可降级情况放大成「整条流程崩」。
+    const root = cwd ?? repoRoot();
     const url = execFileSync('git', ['remote', 'get-url', 'origin'], {
+      cwd: root,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     }).trim();
     const m = url.match(/[:/]([^/]+)\/([^/]+?)(?:\.git)?$/);
     if (m) return { owner: m[1], repo: m[2] };
   } catch {
-    /* 无 remote 时返回 null */
+    /* 无 remote / 非 git 仓库 / repoRoot() 抛错时返回 null */
   }
   return null;
 }
@@ -134,8 +156,8 @@ export function missingGithubConfig(): string[] {
     owner = owner || p?.owner;
     repo = repo || p?.repo;
   }
-  if (!owner) miss.push('GITHUB_OWNER(或留空自动从 git remote 解析)');
-  if (!repo) miss.push('GITHUB_REPO(或留空自动从 git remote 解析)');
+  if (!owner) miss.push('GITHUB_OWNER(或留空,从目标仓库 CODING_REPO_ROOT 的 origin remote 解析)');
+  if (!repo) miss.push('GITHUB_REPO(或留空,从目标仓库 CODING_REPO_ROOT 的 origin remote 解析)');
   return miss;
 }
 

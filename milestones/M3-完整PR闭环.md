@@ -169,16 +169,49 @@ ASCII 速览（M3 范围）：
   唯一可信判据是**写探针的 403 vs 422**：403 = 未授权/权限不足；422 = 鉴权已过、仅参数不合法。
 - 📌 **对后续里程碑的价值**：修完之后 token 若再对某仓库 403，先看 `Repository access`，再看 `Repository permissions` —— 两个都要对
 
-### M3-2 目标仓库切换
+### M3-2 目标仓库切换 ✅ **已完成（2026-09-15）**
 - 内容：`scripts/verify-pr-loop.js` 里硬设 `CODING_REPO_ROOT` 指向靶场仓库的**本地 clone**（**已就绪：`D:\code\pr-agent-e2e`**），并设 `GITHUB_OWNER=wintim1143` / `GITHUB_REPO=pr-agent-e2e` / `GITHUB_BASE_BRANCH=main`。**不依赖外部 shell 环境**（与 M2 同一安全模式）
 - 验收：脚本打印的目标仓库与远端配置正确；前置检查能识别「本地 clone 存在 / 有 remote / 工作区干净」
+- **本轮实际落地**（比原计划多两件事，理由见下）：
+
+| 项 | 状态 |
+|---|---|
+| `scripts/verify-pr-loop.js` 新建 | ✅ 六个阶段：硬设 env → clone 就绪 → remote 双向核对 → **身份反证** → token 写探针 → 汇总 |
+| 硬设 env | ✅ 5 个：`CODING_REPO_ROOT` / `GITHUB_OWNER` / `GITHUB_REPO` / `GITHUB_BASE_BRANCH` / **`GIT_PROXY`**（第 5 个是 M3-3 的依赖，提前落地） |
+| **`parseOwnerRepo()` 改基于 `repoRoot()`** | ✅ 见下「隐藏陷阱」 |
+| **remote ↔ 硬设值双向核对** | ✅ 新增（原计划没有）：防「跑通了但打在错的仓库上」 |
+| token 写权限探针 | ✅ 零副作用，两个权限各一发；本机实测均 **422** |
+| 实跑结果 | ✅ 前置检查全绿，耗时 **5.7s**；单测 **97/97**（原 90 + 7 条回归用例） |
+
+#### 加做第一件：remote ↔ 硬设值双向核对
+
+M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在错的仓库上」**。生产分支错位置的代价不可逆，且全程零报错。所以前置检查里做**三方核对**：
+
+```
+硬设的 OWNER/REPO  ←→  靶场 origin remote 解析值  ←→  REST 写探针实际能写到的仓库
+```
+
+任一处不一致 → 显式失败退出（`--reset` 或 `M3_OWNER/M3_REPO` 覆盖可解）。
+
+#### 加做第二件：**身份一致性反证**（M3-2 的核心证据）
+
+`parseOwnerRepo()` 修好了没有，光看代码不够 —— 脚本在实跑中打印三条对照：
+
+| 调用 | 实测输出 | 说明 |
+|---|---|---|
+| `getGithubConfig()` | `wintim1143/pr-agent-e2e @ main` | 业务实际用的值 ✅ |
+| `parseOwnerRepo()`（cwd = `repoRoot()`） | `wintim1143/pr-agent-e2e` | **修复后**取值 ✅ |
+| `parseOwnerRepo(cwd = pr-agent)` | `wintim1143/pr-agent` | **修复前**的恒定值 —— 反向证明该函数确实按 cwd 走 |
+
+三者对照即可判定修复生效，不需要人工读代码推演。
+
 - ⚠️ **`GITHUB_OWNER` / `GITHUB_REPO` 必须显式设置，不能靠自动解析**（2026-09-15 读码发现）：
   `getGithubConfig()`（`adapters/github.ts:108`）的逻辑是「env 优先，留空则从 `git remote get-url origin` 解析」，
   而 `parseOwnerRepo()`（`:83`）**执行 `git remote get-url origin` 时未指定 cwd** → 用的是**进程工作目录**，
   即 `pr-agent` 自己 → 解析出 `wintim1143/pr-agent`。
   后果是「**push 到靶场 clone，PR 却开到 pr-agent 身上**」这种错位（push 走 `repoRoot()`=`CODING_REPO_ROOT`，
   owner/repo 却来自进程 cwd）。**M3 起会真写远端，这个错位是不可接受的**。
-  → 两条一起做：① M3-2 硬设三个 env；② 把 `parseOwnerRepo()` 改为基于 `repoRoot()`（消除 cwd 隐式依赖）。
+  → 两条一起做：① M3-2 硬设三个 env；② 把 `parseOwnerRepo()` 改为基于 `repoRoot()`（消除 cwd 隐式依赖）。✅ **两条均已完成**
 - 注意：`.env` 里当前**只有 `GITHUB_TOKEN`**，没有 owner/repo —— 所以上述显式设置是必需的，不是可选优化
 - ⚠️ **git 调用需在调用点注入代理**（见 M3-3）：`CODING_REPO_ROOT` 的那份 clone 要能被 push，而本机直连 `github.com` 不通。
   **不写任何持久化代理配置**，由脚本每次调用加 `-c http.proxy=<GIT_PROXY>`
@@ -419,4 +452,52 @@ ASCII 速览（M3 范围）：
     3 文件 +170/-29；ref 落盘已核验，未触发 ref-not-flushed bug）
     > 卡内不钉自身提交的 SHA —— 该提交就含本卡，钉了会形成「每次改卡都要再提交一次」的循环。
     > 需要 SHA 时用 `git log --oneline -1 -- milestones/` 反查
-  - ⬜ 下一步：M3-2 目标仓库切换（显式设 `GITHUB_OWNER`/`GITHUB_REPO` + 修 `parseOwnerRepo()` 的 cwd 隐式依赖）
+  - ✅ 下一步：M3-2 目标仓库切换 —— **已完成，见下节**
+
+---
+
+### 2026-09-15 · M3-2 目标仓库切换 + `parseOwnerRepo` cwd 修复 ✅
+
+- **改了哪些文件**
+  | 文件 | 改动 | 性质 |
+  |---|---|---|
+  | `src/mastra/adapters/github.ts` | `parseOwnerRepo()` 加 `cwd?` 参数、默认走 `repoRoot()`、并 `export`；`repoRoot()` 调用移进 `try` | **重点模块**（本次唯一的生产代码改动） |
+  | `src/mastra/adapters/github.ts` | 模块头注释第 10 行 + `missingGithubConfig()` 两条提示文案，改为「从**目标仓库**的 origin remote 解析」 | 文档同步 |
+  | `scripts/verify-pr-loop.js` | **新建**（约 300 行，六阶段前置检查） | 新增验证基建 |
+  | `test/mastra/github-adapter.test.ts` | 新增 7 条 `parseOwnerRepo` 用例；`BASE_ENV` 补 `CODING_REPO_ROOT` 的恢复 | 回归锁 |
+
+- **核心改动的三个细节（都是「不做就会踩」级别）**
+  1. **为什么必须把 `repoRoot()` 放进 `try` 里**：若写成默认参数 `parseOwnerRepo(cwd = repoRoot())`，
+     `repoRoot()` 会在**实参求值时**抛错（`CODING_REPO_ROOT` 目录不存在 / 不是 git 仓库），
+     **逃逸出函数体、绕过内部 `catch`** → 把「解析不出 owner/repo」这种可降级情况放大成「整条流程崩」。
+     正确写法是 `const root = cwd ?? repoRoot();` 放在 try 内。已加专门用例锁住（`指向不存在目录 → null`）。
+  2. **导出 `parseOwnerRepo` 是为了做实测反证**，不是为外部调用。验证脚本用它打印「修复前/修复后」两个值对照，
+     避免「改完了但没人能证明改对了」。
+  3. **不改 `X-GitHub-Api-Version` / 请求头等无关面**，本次只动 cwd 这一个变量 —— 一次只改一个根因。
+
+- **本轮核实的既有事实**
+  - 本机 `pr-agent` 的 `origin` = `git@github.com:wintim1143/pr-agent.git` → 原实现恒返回 `{owner:'wintim1143', repo:'pr-agent'}`（bug 已实证）
+  - 靶场 `D:\code\pr-agent-e2e`：`main @ b17e66b`、工作区干净、`origin = https://github.com/wintim1143/pr-agent-e2e.git`
+  - token 两个写权限探针仍均 **422**（`contents=write` / `pull_requests=write`）—— M3-1 的结论在本轮复验后依然成立
+
+- **三层验证**
+  | 层 | 手段 | 结果 |
+  |---|---|---|
+  | 编译 | `node ./node_modules/mwtsc/bin/mwtsc.js --cleanOutDir` | ✅ rc=0 |
+  | 单测 | `node ./node_modules/jest/bin/jest.js` 全量 | ✅ **97/97**（原 90 + 新增 7） |
+  | 实跑 | `node scripts/verify-pr-loop.js` | ✅ 六阶段全绿，**5.7s**；身份反证输出 `pr-agent-e2e` ✅（对照值 `pr-agent` = 修复前） |
+
+- **踩坑 / 设计取舍**
+  - **`--reset` 只清本地、不删远端分支**（本轮刻意不做）：远端清理属 M3-7 的职责，
+    且「删远端分支」是破坏性动作，不该混进一个跑在前置检查里的开关
+  - **`--reset` 刻意不加 `git clean -fd`**：untracked 文件可能是有意留下的产物，静默删除风险高于收益。
+    发现工作区脏时改为**列出全部文件 + 提示人工确认**，由人决定丢还是留
+  - **脚本侧独立实现了一份 `parseRemoteUrl()`** 用于与项目实现交叉核对，不复用 `parseOwnerRepo()` ——
+    避免「用被测对象验证被测对象」这种自证循环
+
+- **待确认 / 下一步**
+  - ⬜ **M3-3**：`githubPushAndOpenPR` 的 `git push`（`adapters/github.ts:448`）**尚未注入代理**
+    → 本机直连 `github.com` 不通，直接跑必挂。需加 `-c http.proxy=${process.env.GIT_PROXY}`，同时把
+    「工作树脏则兜底补提交」（`:434`）改为显式报错（否则 commit 闸门失败会被静默绕过）
+  - ⬜ `--run` 分支目前显式 `exit(3)`，待 M3-3 接通 workflow 后启用
+  - ⬜ 本轮改动**未提交**（等用户指令）
