@@ -365,6 +365,87 @@ export function gitDiffForCommit(
 }
 
 /**
+ * 本次改动涉及的**文件路径**清单（相对仓库根，去重排序）。
+ *
+ * ## 为什么要单独一个函数（M4-5）
+ *
+ * `gitDiffForCommit` 返回的是 diff **文本**，而 `agentModifiedTests` 需要的是**路径集合**
+ * ——从 diff 文本里正则抠路径既脆又易被文件名里的空格/引号扰乱。
+ *
+ * 数据源与 `gitDiffForCommit` **完全一致**（已提交差异 ∪ 未提交改动 ∪ 未跟踪新文件），
+ * 这样保证「闸门看到的改动」=「自证检测所依据的改动」=「验收脚本看到的改动」三者同源。
+ * 若哪天 gitDiffForCommit 改了取法，这里必须同步改 —— 否则会出现
+ * 「diff 里有测试文件、检测却说没有」这种静默不一致。
+ */
+export function gitChangedFiles(base = 'main', root: string = repoRoot()): string[] {
+  const run = (args: string[]): string => {
+    try {
+      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const rows = [
+    run(['diff', '--name-only', `${base}...HEAD`]),
+    run(['diff', '--name-only', 'HEAD']),
+    run(['ls-files', '--others', '--exclude-standard']),
+  ]
+    .join('\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+  return Array.from(new Set(rows)).sort();
+}
+
+/**
+ * 同 `gitChangedFiles`，但带 git 变更状态（`A` 新增 / `M` 修改 / `D` 删除 / `R` 重命名）。
+ *
+ * ## 为什么 M4 需要区分「新增」与「修改」（2026-09-15）
+ *
+ * `agentModifiedTests` 要拦的是**自证循环**：agent 把既有断言改松、让它自己通过。
+ * 但「agent **新增**一个测试文件」是另一回事 —— 它不可能削弱既有断言，
+ * 顶多是加了个没有信息量的测试，危害等级完全不同。
+ * 若不区分，一个「顺手给新函数补个测试」的良性 agent 会被误拦，
+ * 而这恰恰是 M4 靶场路径 A 的真实风险（模型很可能觉得补测试是好习惯）。
+ *
+ * 未跟踪文件一律记为 `A`（在 git 眼里就是新增）。
+ */
+export function gitChangedFilesWithStatus(
+  base = 'main',
+  root: string = repoRoot()
+): Array<{ path: string; status: string }> {
+  const run = (args: string[]): string => {
+    try {
+      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    } catch {
+      return '';
+    }
+  };
+  const out: Array<{ path: string; status: string }> = [];
+  const parse = (raw: string): void => {
+    for (const line of raw.split('\n')) {
+      // 格式：`M\tpath` 或 `R100\told\tnew`（重命名三列，取最后一列为新路径）
+      const parts = line.split('\t').map(s => s.trim()).filter(Boolean);
+      if (parts.length < 2) continue;
+      out.push({ path: parts[parts.length - 1], status: parts[0][0] });
+    }
+  };
+  parse(run(['diff', '--name-status', `${base}...HEAD`]));
+  parse(run(['diff', '--name-status', 'HEAD']));
+  for (const f of run(['ls-files', '--others', '--exclude-standard']).split('\n')) {
+    const p = f.trim();
+    if (p) out.push({ path: p, status: 'A' });
+  }
+  // 同一路径可能同时出现在「已提交」与「未提交」两段里：以「非 A」优先（保守取更严重者）
+  const merged = new Map<string, string>();
+  for (const { path: p, status } of out) {
+    const prev = merged.get(p);
+    if (prev === undefined || (prev === 'A' && status !== 'A')) merged.set(p, status);
+  }
+  return Array.from(merged, ([path, status]) => ({ path, status })).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
  * 真正执行一次 git 提交(供 commit 步与 push-open-pr 兜底使用)。
  * - 先 `git add -A`(仅暂跟踪内文件;`.env` 等 gitignore 项不会被加入)
  * - 若没有任何改动可提交,返回 { committed:false, error:'nothing-to-commit' }

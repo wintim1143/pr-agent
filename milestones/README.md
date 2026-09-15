@@ -34,7 +34,7 @@
 | **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ **已完成**（AC-1~AC-7 全量复验通过 + 人工验收通过） |
 | **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | ✅ **已完成**（AC 全绿 + 人工验收通过，2026-09-15 归档）—— 卡：[`M2-本地写入闭环.md`](./M2-本地写入闭环.md) · 验收操作：[`M2-人工验收手册.md`](./M2-人工验收手册.md) |
 | **M3** | 完整 PR 闭环 | push + 开 PR + 人工确认 → squash merge | 是 | ✅ **已完成（2026-09-15）**——八项任务全过：M3-1 靶场+写权限 / M3-2 目标仓库切换 / M3-3 真 push+真开 PR / M3-4 飞书卡片（含 PR 链接）/ **M3-5 跨进程 suspend-resume（含真 squash merge）** / M3-6 远端红线 / M3-7 验证脚本+AC 回填 / M3-8 判负即终止。⚠️ 遗留：**AC-7 需人工去飞书群确认**、远端 PR #1/#2 与 `feat/*` 分支待清理 —— 卡：[`M3-完整PR闭环.md`](./M3-完整PR闭环.md) |
-| **M4** | 真质量闸门 | 把**程序可判定的事实**从 LLM 手里收回：`npm test` 真跑取 exit code，替换 LLM 自评 | 是 | 待开始（⚠️ **范围已缩小**，见下方注） |
+| **M4** | 真质量闸门 | 把**程序可判定的事实**从 LLM 手里收回：测试真跑取 exit code；`passed` 拆为 `testsPassed`（程序）+ `requirementMet`（LLM）后合成 | 是 | ✅ **已完成**（2026-09-15）· 单测 174/174 · `--adapter` 17/17 · `--path-a` 10/10 · `--path-b` 11/11 · `--path-c` 9/9 —— 卡：[`M4-真质量闸门.md`](./M4-真质量闸门.md) · 图：[`M4-真质量闸门-flow.md`](./M4-真质量闸门-flow.md) |
 | **M5** | 多仓库 + 权限收窄 | RepoTarget 支持多仓库、GitHub App 鉴权、幂等防重复触发 | 是 | 待开始 |
 | **M6** | 可观测与成本 | run 追踪、LLM 成本回写、失败重试与告警 | — | 待开始 |
 
@@ -43,6 +43,16 @@
 > ② commitlint 真校验：**经核实不适用** —— 本项目无 commitlint（无依赖 / 无配置 / 无 husky），原来让 LLM 回答的 `lintPassed` 字段已删除；
 > ③ `npm test` 真跑：**唯一剩余项**。
 > 因此 M4 的重定义收敛为一句话：**把凡是程序能判定的字段（测试结果、lint 结果、diff 存在性）从 LLM 手里收回，改为程序写入**。
+>
+> 📌 **建卡后补充的两条约束（2026-09-15，详见卡 §1 / §3）**：
+> - **第 0 号前置：靶场无测试可跑**。`wintim1143/pr-agent-e2e` 是 README-only 仓库、**无 `package.json`**
+>   → 「真跑 `npm test`」**当前无对象**。M4 必须先给靶场补「被测文件 + **人工预置**测试」。
+>   ⚠️ 测试**必须人写** —— 若由 coding agent 自己写，就是「自己出卷自己判卷」，断言可以恒真，零信息量。
+> - **必须拆字段，不能让程序覆写 `passed`**。`passed` 底下压着两个性质完全不同的问题：
+>   ①「测试过了吗」（**事实**，需执行能力 → 归程序）②「需求实现了吗」（**语义**，需阅读理解 → 归 LLM）。
+>   合成一个布尔值之后，事后无法分辨「判负是因为测试红」还是「模型认为需求没做」—— 排障时这条信息最贵。
+>   完整判据归属表见卡 §1。⚠️ `testsPassed = null`（无测试可跑）**绝不可等价于 `true`** ——
+>   这与 M2 那次让 LLM 回答 `lintPassed` 的幻觉是同构错误。
 
 ### 与旧方案的映射（避免上下文丢失）
 
@@ -60,14 +70,14 @@
 
 ## 里程碑间解锁关系
 
-每个里程碑都是「薄切片」，但切片之间不是孤立的——前一个跑通后沉淀的可复用基建，直接变成后一个的起跑线。下表把这条递进链显式写出来（M2–M6 卡未建，解锁关系先按路线图标预期；建卡后在各自 §解锁与复用 回填实际复用）。
+每个里程碑都是「薄切片」，但切片之间不是孤立的——前一个跑通后沉淀的可复用基建，直接变成后一个的起跑线。下表把这条递进链显式写出来（M1–M4 卡已建；M5–M6 卡未建，其解锁关系先按路线图标预期，建卡后在各自 §解锁与复用 回填实际复用）。
 
 | 里程碑 | 沉淀的可复用基建 | 解锁的下一里程碑能力 | 前置输入/外部依赖 |
 |---|---|---|---|
 | **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 | GitHub/飞书配置 + 中继可用 |
 | **M2 本地写入** | `CODING_REPO_ROOT` 目标仓库配置口子、**已实证的 `guard.ts` 围栏**（受保护路径 / 危险命令 / 越界三类拦截）、`stopAfterCommit` 编排开关、端到端验证脚本骨架 | **M3**：换远端仓库只改 env；红线已实证故敢真 push；`stopAfterCommit=false` 即恢复完整八步 | 编码后端凭据（`~/.claude/settings.json` 的 cc-switch 代理）+ 沙箱仓库 `D:\code\pr-agent-sandbox` |
 | **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库 = 专用靶场 `wintim1143/pr-agent-e2e`（已定）** | **M4**：在真实 PR 上挂真质量闸门 | 靶场仓库 + fine-grained token（Contents/Pull requests = write） |
-| **M4 真闸门** | `npm test` 真跑 / `git diff` 真喂 review / commitlint 真校验（替换 LLM 自评） | **M5**：把闸门扩展到多仓库 + GitHub App 鉴权 |
+| **M4 真闸门** | 程序侧**测试执行器**（`adapters/test-runner.ts`：探测 / 白名单执行 / 超时杀进程树 / 输出截断 / env 剥离凭据）、拆字段后的闸门契约（`testsPassed` 归程序 + `requirementMet` 归 LLM）、`agentModifiedTests` 自证检测（**默认阻断**）、`runGate` 重试回灌（P0-2） | **M5**：`runTests(root)` 只吃一个路径参数，换 `CODING_REPO_ROOT` 即可复用于多仓库（多仓库能力的第一块砖） | ✅ 靶场已补「`src/greet.js` + **人工预置**测试 `test/greet.test.js`」（零依赖 `node --test`，靶场 `main` = `21f4e7a`）；**无需新增任何外部凭据** |
 | **M5 多仓库** | RepoTarget 多仓库、GitHub App 鉴权、幂等防重触发 | **M6**：在稳定的多仓库上做可观测与成本 |
 | **M6 可观测** | run 追踪、成本回写、失败重试与告警 | （终点） |
 
@@ -98,7 +108,7 @@ milestones/
 ├── M2-本地写入闭环.md / -flow.md        ← ✅ 已完成（2026-09-15 归档）
 ├── M2-人工验收手册.md                   ← M2 的复现手册（已验收，保留作复现用）
 ├── M3-完整PR闭环.md / -flow.md          ← ✅ 已完成（2026-09-15）· 八项任务全过
-└── （M4 卡待建）                         ← ⬜ 下一个里程碑
+└── M4-真质量闸门.md / -flow.md          ← ✅ 已完成（2026-09-15）· 七项任务全过
 ```
 
 单个里程碑卡统一包含十节（🟦=定义期必填，🟨=实施期渐进补全）：

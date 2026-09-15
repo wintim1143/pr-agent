@@ -9,7 +9,10 @@ import {
   githubMergePR,
   gitCommit,
   gitDiffForCommit,
+  gitChangedFilesWithStatus,
 } from '../adapters/github';
+import { runTests, detectAgentTouchedTests } from '../adapters/test-runner';
+import type { TestRunResult } from '../adapters/test-runner';
 import { stage, stageStart } from '../progress';
 
 /**
@@ -44,8 +47,9 @@ import { stage, stageStart } from '../progress';
  * 注意:1.63.2 用 `createStep({...})` 工厂(不是 `new Step(...)`);`Step` 仅为类型。
  */
 /**
- * 结构化闸门输出契约(文档 P3-1,2026-09-02 定稿;2026-09-15 修契约缺失)。
- * - test: 测试闸门,passed 决定是否进入 review
+ * 结构化闸门输出契约(文档 P3-1,2026-09-02 定稿;2026-09-15 修契约缺失;2026-09-15 M4 拆字段)。
+ * - test: 测试闸门,**拆成程序侧事实(`testsPassed`/`agentModifiedTests`)+ LLM 侧语义(`requirementMet`)**
+ *   再由程序合成 `passed`(M4)。M3 时它是一个 LLM 单判的 `passed`
  * - review: 审核闸门,decision 决定通过(approve)或打回(request-changes)
  * - commit: commit 闸门,message 是最终落盘的提交文案
  *
@@ -59,9 +63,70 @@ import { stage, stageStart } from '../progress';
  * 所以本文件的约定是:**每个 schema 的字段必须逐字出现在对应 prompt 的「输出契约」段里**,
  * 并附一个示例。改 schema 必须同步改 prompt —— 只改一边等于把闸门调成恒失败。
  */
-const TestGateSchema = z.object({
-  passed: z.boolean(),
+/**
+ * test 闸门的 LLM 侧输出契约 —— M4 拆分后的**语义半边**。
+ *
+ * ## 为什么这里没有 `passed` / `testsPassed`（M4 的核心结论）
+ *
+ * M3 的契约是 `{passed, report}`。名字底下其实压着**两个性质完全不同**的问题：
+ * ①「测试过了吗」—— 事实，需要**执行能力**，LLM 没有；
+ * ②「需求实现了吗」—— 语义判断，需要阅读理解，程序做不到。
+ *
+ * 合成一个布尔值之后，事后无法分辨「判负是因为测试红」还是「判负是因为模型认为需求没做」——
+ * 排障时这一条信息最贵。M4 因此把它拆开：
+ * - `testsPassed` 由**程序**跑命令取 exit code 写入（见 `testStep` / `adapters/test-runner.ts`）
+ * - `requirementMet` 由 **LLM** 判（本 schema）
+ * - `passed` 由**程序**合成：`(testsPassed !== false) && requirementMet`
+ *
+ * ⚠️ 因此本 schema **绝不接受**模型输出任何测试结论字段。模型说「我跑了测试，通过了」
+ * 在结构上就无处安放 —— 这比在 prompt 里写「禁止声称跑过实际未执行的测试」可靠得多：
+ * 后者是祈祷，前者是结构。
+ *
+ * ⚠️ 导出供单测断言「LLM 侧不存在 testsPassed 字段」这一**结构性质**。
+ */
+export const LlmTestGateSchema = z.object({
+  requirementMet: z.boolean(),
   report: z.string(),
+});
+/** 程序侧测试执行结果契约（`TestRunResult` 的 zod 镜像，用于落进 workflow 上下文）。 */
+const TestRunSchema = z.object({
+  executed: z.boolean(),
+  runner: z.string().nullable(),
+  command: z.string().nullable(),
+  exitCode: z.number().nullable(),
+  durationMs: z.number(),
+  timedOut: z.boolean(),
+  reason: z.string(),
+  testFileCount: z.number(),
+});
+
+/**
+ * test 闸门的**完整**输出契约（程序合成后的形态）。
+ *
+ * ⚠️ **`testsPassed = null` 绝不可等价于 `true`**。
+ * 「没有测试可跑」和「测试通过」是两件事 —— 混为一谈就是 M2 那次 `lintPassed`
+ * 幻觉字段的同构错误（详见 `CommitGateSchema` 上方注释）。
+ * null 时 `passed` 只由 `requirementMet` 决定，**不添绿也不添红**。
+ *
+ * ⚠️ 导出同为单测可达（断言 null 语义与程序侧字段归属）。
+ */
+export const TestGateSchema = z.object({
+  /** 程序写入：`true`=exit 0 / `false`=非零或超时 / `null`=未执行（无测试可跑） */
+  testsPassed: z.boolean().nullable(),
+  /** LLM 写入：需求是否被实现（语义判断） */
+  requirementMet: z.boolean(),
+  /** 程序写入：agent 是否改/删了**既有**测试文件（自证风险） */
+  agentModifiedTests: z.boolean(),
+  /** 被改/删的既有测试文件清单 */
+  modifiedTestFiles: z.array(z.string()),
+  /** 新增的测试文件清单（低危，仅记录） */
+  addedTestFiles: z.array(z.string()),
+  /** 程序合成：(testsPassed !== false) && requirementMet */
+  passed: z.boolean(),
+  /** 程序前缀 + LLM 解读（前缀保证「未跑测试」这件事不会被模型漏写） */
+  report: z.string(),
+  /** 程序侧执行的原始事实 */
+  testRun: TestRunSchema,
 });
 const ReviewGateSchema = z.object({
   decision: z.enum(['approve', 'request-changes']),
@@ -136,20 +201,41 @@ const ContextSchema = z.object({
  *
  * 改为:plain generate + 提示词强制「只输出 JSON」→ 从文本中抽取 JSON → **zod 严格解析**。
  * 解析失败仍抛错(fail-closed,与原 strict 策略语义一致)—— 闸门宁可不通过,不能假通过。
+ *
+ * ⚠️ 导出仅为单测可达(M4-6 的「重试回灌」必须断言第二次调用收到的 prompt)。
  */
-async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: string, schema: S): Promise<z.infer<S>> {
+export async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: string, schema: S): Promise<z.infer<S>> {
   const agent = mastra.getAgent('dev-agent');
-  const prompt =
-    `${instruction}\n\n【输出格式(强制)】最终回答只输出一个 JSON 对象,不要包含任何解释性文字或代码围栏以外的内容。`;
+  const basePrompt = `${instruction}\n\n【输出格式(强制)】最终回答只输出一个 JSON 对象,不要包含任何解释性文字或代码围栏以外的内容。`;
   // 重试(2026-09-07 补):glm 中继偶发**空响应**(res.text 为空,2026-09-07 review 步实测),
   // 以及偶发不守 JSON 格式。这类瞬时故障重试即可恢复,不该直接炸掉整条流水线。
   // 重试仍失败则抛错(fail-closed)——闸门宁可不通过,不能假通过。
   const maxAttempts = Number(process.env.GATE_MAX_ATTEMPTS ?? 3);
   const t0 = Date.now();
   let lastErr: Error | undefined;
+  /**
+   * 上一次失败的**具体原因**，回灌进下一次 prompt（M4-6，吸收 P0-2）。
+   *
+   * ## 修之前是"盲重试"
+   *
+   * 原实现重试时**重新构造一模一样的 prompt**。模型看不到自己上次错在哪，
+   * 于是「第 N 次还是同样的错」——实测 M3 之前 commit 步 3 次重试**byte 级相同**，
+   * 三次全挂、白烧三次调用。
+   *
+   * ## 为什么只回灌"可修正"的错误
+   *
+   * 区分两类失败：
+   * - **模型可自我修正的**：schema 不符（缺字段 / 类型错 / 枚举值非法）、输出里没有 JSON
+   *   → 把 zod 的报错原文喂回去，模型下次就知道要改什么
+   * - **模型无能为力的**：网络错误、中继 502、响应为空
+   *   → 回灌「上次你没返回任何内容」基本无用（不是格式问题），但成本极低，
+   *     且能提示它别返回空。这里统一回灌，但把错误原文一并给出，不做二次猜测。
+   */
+  let feedback = '';
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      stage('llm:start', { stage: 'gate', attempt, maxAttempts });
+      const prompt = feedback ? `${basePrompt}\n\n${feedback}` : basePrompt;
+      stage('llm:start', { stage: 'gate', attempt, maxAttempts, withFeedback: Boolean(feedback) });
       const res = await agent.generate(prompt);
       const obj = extractJson(res.text);
       const parsed = schema.safeParse(obj);
@@ -165,6 +251,12 @@ async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: stri
       lastErr = e instanceof Error ? e : new Error(String(e));
       console.warn(`[runGate] 第 ${attempt}/${maxAttempts} 次闸门调用失败: ${lastErr.message}`);
       stage('llm:retry', { stage: 'gate', attempt, maxAttempts, error: lastErr.message.slice(0, 200) });
+      feedback =
+        `【上一次尝试失败,请据此修正】\n` +
+        `错误类型: ${lastErr.message.split(':')[0]}\n` +
+        `错误详情: ${lastErr.message.slice(0, 600)}\n` +
+        `要求: 严格按上面的【输出契约】输出。字段名逐字一致、类型正确、枚举值取限定字面量之一。` +
+        `只输出一个 JSON 对象,不要输出解释、不要套多余嵌套。`;
       if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
@@ -209,11 +301,49 @@ function extractJson(text: string | undefined | null): unknown {
  * @param maxChars 截断上限;不传则由 `gitDiffForCommit` 读 `COMMIT_DIFF_MAX_CHARS`(默认 8000)
  */
 function buildChangeContext(maxChars?: number): { text: string; diffChars: number; truncated: boolean } {
-  const { stat, diff, truncated } = gitDiffForCommit('main', maxChars);
+  const { stat, diff, truncated } = gitDiffForCommit(baseBranch(), maxChars);
   const text =
     `【改动统计】\n${stat || '(无 diff stat)'}\n\n` +
     `【改动内容 diff】\n${diff || '(无 diff 内容 —— 工作树与目标分支均无差异)'}`;
   return { text, diffChars: diff.length, truncated };
+}
+
+/**
+ * 本次改动的目标基线分支。
+ *
+ * 2026-09-15（M4）修：原实现把 `'main'` 硬编码在 `buildChangeContext` / 测试脚本里。
+ * `GITHUB_BASE_BRANCH` 一旦不是 main（靶场以外都可能改），diff 会静默变空 →
+ * 三个闸门全部在「看不见改动」的状态下判负。这类失效不报错，只让闸门恒挂。
+ */
+function baseBranch(): string {
+  return getGithubConfig()?.baseBranch || process.env.GITHUB_BASE_BRANCH || 'main';
+}
+
+/**
+ * 把程序跑出的测试事实渲染成 prompt 里的一段「不可推翻的输入」（M4-3）。
+ *
+ * ⚠️ 措辞是本段的全部价值所在：必须让模型明白**测试结论不归它判**。
+ * 只说「以下是测试结果」，模型很可能仍然在 report 里写「测试通过，故需求已实现」，
+ * 把两个正交的结论又混起来 —— 那就退回了 M4 之前的形态。
+ */
+function renderTestRunFact(r: TestRunResult): string {
+  if (!r.executed) {
+    return (
+      `【程序侧测试执行结果】**本次未执行测试**（原因: ${r.reason}）\n` +
+      `  → 测试结论 = null（未知）。**这不是「测试通过」**，不要在 report 里写成通过。\n` +
+      `  → 请仅依据 diff 判断需求是否实现。`
+    );
+  }
+  const verdict = r.timedOut ? '超时被杀（判负）' : r.exitCode === 0 ? '通过' : '失败（判负）';
+  return (
+    `【程序侧测试执行结果】（由编排层真实执行，**事实，不可推翻**）\n` +
+    `  - runner: ${r.runner}\n` +
+    `  - 命令: ${r.command}\n` +
+    `  - 退出码: ${r.exitCode}（0=通过，非 0=失败）\n` +
+    `  - 结论: ${verdict}\n` +
+    `  - 耗时: ${r.durationMs}ms / 发现的测试文件数: ${r.testFileCount}\n` +
+    `  - 输出尾部:\n${r.outputTail || '(无输出)'}`
+  );
 }
 
 /** 生成 PR 描述(供 push-open-pr 步使用) */
@@ -224,7 +354,24 @@ function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
     `**需求**: ${ctx.issueTitle}`,
     '',
     ctx.issueBody ? `**描述**:\n${ctx.issueBody}\n` : '',
-    ctx.testResult ? `**测试**: ${ctx.testResult.passed ? '✅ 通过' : '❌ 未通过'} —— ${ctx.testResult.report}` : '',
+    ctx.testResult
+      ? // M4:把「程序侧事实」与「LLM 侧语义」**分开显示**，而不是笼统一句「通过/未通过」。
+        // 读 PR 的人据此能一眼看出：测试到底跑没跑、退出码多少、agent 有没有动测试文件。
+        `**测试**: ${ctx.testResult.passed ? '✅ 通过' : '❌ 未通过'}\n` +
+        `- 程序执行: ${
+          ctx.testResult.testRun.executed
+            ? `\`exit=${ctx.testResult.testRun.exitCode}\` (${ctx.testResult.testRun.reason}, ${ctx.testResult.testRun.durationMs}ms, ${ctx.testResult.testRun.testFileCount} 个测试文件)`
+            : `**未执行** (${ctx.testResult.testRun.reason})`
+        } → \`testsPassed=${ctx.testResult.testsPassed}\`\n` +
+        `- 需求判定(LLM): \`requirementMet=${ctx.testResult.requirementMet}\`\n` +
+        `- 测试文件改动: ${
+          ctx.testResult.agentModifiedTests
+            ? `⚠️ agent 改动既有测试 ${ctx.testResult.modifiedTestFiles.join(', ')}`
+            : ctx.testResult.addedTestFiles.length
+              ? `agent 新增测试 ${ctx.testResult.addedTestFiles.join(', ')}（未削弱既有断言）`
+              : '无'
+        }\n${ctx.testResult.report}`
+      : '',
     ctx.reviewResult
       ? `**审核**: ${ctx.reviewResult.decision}${ctx.reviewResult.comments.length ? ` (${ctx.reviewResult.comments.join('; ')})` : ''}`
       : '',
@@ -359,33 +506,143 @@ const coding = createStep({
   },
 });
 
-// 3. test(强制):测试 skill
+// 3. test(强制):程序真跑测试取 exit code + LLM 判需求是否实现 → 程序合成 passed
 const testStep = createStep({
   id: 'test',
-  description: '调用测试 skill,不通过不可进入审核',
+  description: '程序真跑测试取 exit code(M4) 并检测测试是否被改动,LLM 只判需求是否实现,程序合成 passed',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
     const p = stageStart('test');
     try {
-      // 2026-09-15 修:原先 prompt 只给 issueTitle,模型看不见改动 → 恒判 false(盲评)。
-      // 现在把真实 diff + coding 自述一起喂进去,判定才有依据。
+      // 懒加载取仓库根(与 coding 步同源),避免静态引入 @mastra/claude 干扰框架初始化
+      const { getRepoRoot } = await import('../agents/coding-agent.js');
+      const root = getRepoRoot();
       const change = buildChangeContext();
+
+      // ================= 程序路 1：真跑测试（M4-1）=================
+      // 事实只能由程序产出。这一段与 LLM 无关 —— 模型既不知道它跑没跑，
+      // 也无法影响它的结论（下面 prompt 里连测试结论字段都不存在）。
+      const testRun = await runTests(root);
+      const testsPassed = testRun.executed ? testRun.exitCode === 0 : null;
+      stage('test:run', {
+        executed: testRun.executed,
+        runner: testRun.runner,
+        // AC-1 的证据就在这里：把**可直接复跑的完整命令**落进结构化日志。
+        // 不记的话，「程序真跑了测试」只能靠脚本的间接复跑证明，人工没法照原样重放。
+        command: testRun.command,
+        exitCode: testRun.exitCode,
+        durationMs: testRun.durationMs,
+        reason: testRun.reason,
+        testFileCount: testRun.testFileCount,
+        testsPassed,
+      });
+      if (testRun.command) console.log(`[test] 程序侧真实执行的命令: ${testRun.command}`);
+
+      // ================= 程序路 2：自证检测（M4-5）=================
+      // 「跑测试」这件事可不可信，取决于**测试是谁写的**，而不是跑没跑。
+      // agent 把既有断言改松，就能给自己发通行证 —— 必须程序侧识别。
+      const touched = detectAgentTouchedTests(gitChangedFilesWithStatus(baseBranch(), root));
+      const agentModifiedTests = touched.modified.length > 0;
+      stage('test:touch', {
+        agentModifiedTests,
+        modified: touched.modified,
+        added: touched.added,
+        testRunExitCode: testRun.exitCode,
+      });
+
+      /**
+       * 「agent 改了既有测试」的处置（卡 §0 待拍板项 1 的定案：**默认阻断**）。
+       *
+       * 为什么不放行：测试在此充当的是**需求的可执行规格**，agent 改它就等于改考卷。
+       * 它与「测试红了」是两种不同的失败 —— 前者是判据被动过，后者是产物不合格。
+       *
+       * 为什么留 `warn` 开关：确有「需求变更、顺带更新测试」的正当场景。
+       * 但那是**人的决定**，所以降级必须是显式配置，不能是默认行为 ——
+       * 这里刻意做成「默认 block，写 env 才降级」，而不是反过来。
+       *
+       * 注意：只有**改/删既有测试**才触发（`touched.modified`）。
+       * 新增测试文件（`touched.added`）不削弱既有断言，仅记录不阻断 ——
+       * 否则一个「顺手给新函数补个测试」的良性 agent 会被误拦。
+       */
+      const modifyPolicy = (process.env.TEST_GUARD_MODIFY_TESTS ?? 'block').toLowerCase();
+      if (agentModifiedTests && modifyPolicy !== 'warn') {
+        const msg =
+          `GATE_REJECTED@test: agent 修改/删除了既有测试文件 → 自证循环(自己改考卷),已阻断。` +
+          `被改动的测试文件: ${touched.modified.join(', ')}` +
+          ` | 本次程序侧测试结果: exit=${testRun.exitCode ?? 'n/a'}(${testRun.reason})` +
+          ` | 若确认属正当的规格变更,设 TEST_GUARD_MODIFY_TESTS=warn 显式降级为仅告警。`;
+        console.warn(`[test] ${msg}`);
+        p.fail(msg, { agentModifiedTests: true, modified: touched.modified });
+        throw new Error(msg);
+      }
+
+      // ================= 语义路：LLM 只判 requirementMet（M4-3）=================
       stage('llm:start', { stage: 'test', diffChars: change.diffChars, truncated: change.truncated });
-      const testResult = await runGate(
+      const llm = await runGate(
         mastra,
-        `使用 code-testing skill 对**下列改动**运行/评估测试。\n\n` +
-          `【需求】${inputData.issueTitle}\n\n` +
-          `【编码者自述】\n${(inputData.codingResult ?? '(无)').slice(0, 1500)}\n\n` +
+        `你要判断的是:**下列改动有没有实现需求**。\n` +
+          `（不是「测试过没过」—— 那件事已由编排层真实执行完毕,结果在下面给出,不由你判断。）\n\n` +
+          `【需求】${inputData.issueTitle}\n` +
+          (inputData.issueBody ? `【需求描述】\n${inputData.issueBody}\n` : '') +
+          `\n【编码者自述】\n${(inputData.codingResult ?? '(无)').slice(0, 1500)}\n\n` +
+          `${renderTestRunFact(testRun)}\n\n` +
           `${change.text}\n\n` +
           `【输出契约(强制)】只输出一个 JSON 对象,字段如下(不得增删):\n` +
-          `{\n  "passed": boolean,   // 改动是否可安全进入审核\n  "report": string      // 你根据上面 diff 得出的结论与依据\n}\n` +
-          `示例:{"passed":true,"report":"新增 README 安装小节,两条命令与需求一致;纯文档改动无测试可跑。"}\n\n` +
-          `【判定依据】passed 必须基于**上面看到的真实改动**。若仓库存在可执行测试,以其结果为准;` +
-          `若为纯文档/配置类改动(无可执行测试),则判断改动本身是否满足需求、是否引入破坏性变更。` +
-          `改动为空或明显不完整时判 false,并在 report 里说明缺什么。**不要为看不见的内容背书。**`,
-        TestGateSchema
+          `{\n  "requirementMet": boolean,  // 上面的改动是否真正实现了【需求】\n` +
+          `  "report": string            // 你的判断依据(请引用具体文件/具体行为)\n}\n` +
+          `示例:{"requirementMet":true,"report":"src/greet.js 新增 shout() 导出函数,按需求返回大写问候语;未改动 greet 既有行为。"}\n\n` +
+          `【职责边界(重要)】\n` +
+          `1. 测试**是否通过**由程序真实执行得出,已在上方给出,**不由你判断**。不要输出任何测试结论字段。\n` +
+          `2. 你只回答一个问题:**改动是否实现了【需求】**。\n` +
+          `3. 需求未被实现 / 改动为空 / 明显不完整 → requirementMet=false,并在 report 里说清缺什么。\n` +
+          `4. **不要为看不见的内容背书。**`,
+        LlmTestGateSchema
       );
+
+      // ================= 程序合成 passed（M4-3）=================
+      // `testsPassed=null`（未跑测试）与 `testsPassed=true` 都**不阻断**，
+      // 但 null 只在 report 里留白，不添绿 —— 见 TestGateSchema 注释。
+      const passed = testsPassed !== false && llm.requirementMet;
+
+      // report 由**程序前缀 + LLM 解读**拼成。前缀的意义：
+      // 「本次未执行测试」这件事绝不能依赖模型自觉写出来（它很可能只字不提,
+      // 读报告的人就会默认「没提 = 没问题」）。事实陈述必须是程序写死的。
+      const programPrefix = [
+        testRun.executed
+          ? `[程序] 测试已执行: exit=${testRun.exitCode} (${testRun.reason}) → testsPassed=${testsPassed}`
+          : `[程序] **本次未执行测试** (${testRun.reason}) → testsPassed=null（未知,**不是通过**)`,
+        `[程序] 需求是否实现(LLM 判定): requirementMet=${llm.requirementMet}`,
+        agentModifiedTests
+          ? `[程序] ⚠️ agent 改动了既有测试文件: ${touched.modified.join(', ')}（已按策略 ${modifyPolicy} 处理）`
+          : touched.added.length
+            ? `[程序] agent 新增了测试文件: ${touched.added.join(', ')}（未削弱既有断言,仅记录）`
+            : '',
+        `[程序] 合成结论: passed=${passed}`,
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      const testResult = {
+        testsPassed,
+        requirementMet: llm.requirementMet,
+        agentModifiedTests,
+        modifiedTestFiles: touched.modified,
+        addedTestFiles: touched.added,
+        passed,
+        report: `${programPrefix}\n\n${llm.report}`,
+        testRun: {
+          executed: testRun.executed,
+          runner: testRun.runner,
+          command: testRun.command,
+          exitCode: testRun.exitCode,
+          durationMs: testRun.durationMs,
+          timedOut: testRun.timedOut,
+          reason: testRun.reason,
+          testFileCount: testRun.testFileCount,
+        },
+      };
+
       // M3-8:闸门判负 → **显式终止**,不再往下走 review / commit / push-open-pr。
       //
       // ## 为什么是 throw,而不是 Mastra 条件边(`.branch()`)
@@ -405,14 +662,17 @@ const testStep = createStep({
       // 结论:闸门判负的终止路径用「step 内显式失败」表达 —— 语义等价(后续一律不执行),
       // 且是 fail-closed。**有意只做「终止」,不做「回退 coding 重做」**:回退需要循环
       // (`.dowhile()`)+ 次数上限 + 失败累积策略,属独立工作量,M3 范围外(见卡 §7 M3-8)。
-      if (!testResult.passed) {
+      if (!passed) {
+        // M4:判负理由**分开列**。M2/M3 时只有一个 passed,事后无法分辨
+        // 「是测试红」还是「是模型认为需求没做」—— 排障时这一条信息最贵。
         const msg =
           `GATE_REJECTED@test: 测试闸门判负,终止流水线(不进入 review/commit/push)。` +
-          `报告: ${testResult.report.slice(0, 300)}`;
-        p.fail(msg, { passed: false });
+          `testsPassed=${testsPassed}(exit=${testRun.exitCode ?? 'n/a'},reason=${testRun.reason})` +
+          ` | requirementMet=${llm.requirementMet} | 详情: ${llm.report.slice(0, 300)}`;
+        p.fail(msg, { testsPassed, requirementMet: llm.requirementMet });
         throw new Error(msg);
       }
-      p.done({ passed: true });
+      p.done({ passed: true, testsPassed, requirementMet: llm.requirementMet });
       return { ...inputData, testResult };
     } catch (e) {
       p.fail(e);

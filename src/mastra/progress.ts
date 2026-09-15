@@ -45,7 +45,22 @@ export type ProgressEvent =
    * —— 「红线确实生效了」这件事**事后无法从任何持久化文件证明**。
    * M3-6 的验收恰恰要求「deny 日志出现且远端未受影响」,故把拦截动作落成结构化事件。
    */
-  | 'guard:deny';
+  | 'guard:deny'
+  /**
+   * 测试闸门的**程序侧**事实(M4-1,2026-09-15 新增)。
+   *
+   * 为什么需要:`test:run` 的结论（跑没跑 / exit code / 耗时 / 未执行原因）
+   * 与 LLM 无关，却又是判负时最需要回溯的一手信息。只打 console 会随会话消失，
+   * 落成结构化事件后可用 `grep test:run logs/dev-workflow.log` 直接复核。
+   */
+  | 'test:run'
+  /**
+   * agent 是否动过测试文件(M4-5,2026-09-15 新增)。
+   *
+   * 「跑测试」可信度取决于**测试是谁写的**。这条事件记录本次改动对测试文件的触碰情况
+   * （`modified` 高危 / `added` 仅记录），是自证检测唯一的持久化证据。
+   */
+  | 'test:touch';
 
 export interface ProgressFields {
   /** 流水线阶段名(checkout / coding / test / review / commit / push-open-pr / notify / merge) */
