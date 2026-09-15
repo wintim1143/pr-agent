@@ -32,17 +32,23 @@
 | 里程碑 | 名称 | 端到端演示的效果 | 是否写目标仓库 | 状态 |
 |---|---|---|---|---|
 | **M1** | 只读洞察闭环 | 飞书发一句话 → 拉 GitHub issue/commits → LLM 汇总 → 卡片回推 → 人工点按钮 resume | **否**（只读 REST） | ✅ **已完成**（AC-1~AC-7 全量复验通过 + 人工验收通过） |
-| **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | 🟡 **待人工验收**（M2-1~M2-6 实证完成：正常闭环 7/7 AC、红线拦截、失控上限显式失败）—— 卡：[`M2-本地写入闭环.md`](./M2-本地写入闭环.md) · 验收操作：[`M2-人工验收手册.md`](./M2-人工验收手册.md) |
-| **M3** | 完整 PR 闭环 | push + 开 PR + 飞书卡片确认 → squash merge | 是 | 待开始 |
-| **M4** | 真质量闸门 | `npm test` 真跑、`git diff` 真喂给 review、commitlint 真校验，替换 LLM 自评 | 是 | 待开始 |
+| **M2** | 本地写入闭环 | 真起编码 agent 在 feature 分支改文件 + 真 commit，**不 push** | 仅本地分支 | ✅ **已完成**（AC 全绿 + 人工验收通过，2026-09-15 归档）—— 卡：[`M2-本地写入闭环.md`](./M2-本地写入闭环.md) · 验收操作：[`M2-人工验收手册.md`](./M2-人工验收手册.md) |
+| **M3** | 完整 PR 闭环 | push + 开 PR + 人工确认 → squash merge | 是 | 🟡 **待开始** —— 卡：[`M3-完整PR闭环.md`](./M3-完整PR闭环.md) · **D4 已定**：目标仓库 = `wintim1143/pr-agent-e2e`（专用靶场，零污染） |
+| **M4** | 真质量闸门 | 把**程序可判定的事实**从 LLM 手里收回：`npm test` 真跑取 exit code，替换 LLM 自评 | 是 | 待开始（⚠️ **范围已缩小**，见下方注） |
 | **M5** | 多仓库 + 权限收窄 | RepoTarget 支持多仓库、GitHub App 鉴权、幂等防重复触发 | 是 | 待开始 |
 | **M6** | 可观测与成本 | run 追踪、LLM 成本回写、失败重试与告警 | — | 待开始 |
+
+> ⚠️ **M4 范围变化（2026-09-15 据实修订）**：原定义的三项 ——
+> ① `git diff` 真喂 review：**已在 M2 收尾时完成**（且扩到 test/commit 三闸门，见 M2 卡 §11 归档日志）；
+> ② commitlint 真校验：**经核实不适用** —— 本项目无 commitlint（无依赖 / 无配置 / 无 husky），原来让 LLM 回答的 `lintPassed` 字段已删除；
+> ③ `npm test` 真跑：**唯一剩余项**。
+> 因此 M4 的重定义收敛为一句话：**把凡是程序能判定的字段（测试结果、lint 结果、diff 存在性）从 LLM 手里收回，改为程序写入**。
 
 ### 与旧方案的映射（避免上下文丢失）
 
 | 旧工单 | 落到哪个里程碑 |
 |---|---|
-| S0（拍板 D4 目标仓库） | **被绕开**：M1/M2 不写远端，D4 推迟到 M3 前再定 |
+| S0（拍板 D4 目标仓库） | **M3 建卡前已定**：新建专用靶场仓库 `wintim1143/pr-agent-e2e`（零污染；把「链路对不对」与「产物对不对」分开验） |
 | S1（HTTP 触发入口） | M1（只读版入口） → M3 补齐业务语义 |
 | S2（真编码验收） | M2 + M3 |
 | S3（真闸门，核心债） | M4 |
@@ -60,7 +66,7 @@
 |---|---|---|---|
 | **M1 只读洞察** | `githubIntegration` / `feishuIntegration`（继承 `Integration` 基类）、`insight-workflow` 四步编排骨架（collect→summarize→notify→confirm + `suspend/resume`）、LibSQLStore 跨请求恢复 | **M2**：复用同一 GitHub client 扩展出写分支 / commit；复用 workflow 骨架，把 step2 换编码 agent、step4 换「开 PR 确认」 | GitHub/飞书配置 + 中继可用 |
 | **M2 本地写入** | `CODING_REPO_ROOT` 目标仓库配置口子、**已实证的 `guard.ts` 围栏**（受保护路径 / 危险命令 / 越界三类拦截）、`stopAfterCommit` 编排开关、端到端验证脚本骨架 | **M3**：换远端仓库只改 env；红线已实证故敢真 push；`stopAfterCommit=false` 即恢复完整八步 | 编码后端凭据（`~/.claude/settings.json` 的 cc-switch 代理）+ 沙箱仓库 `D:\code\pr-agent-sandbox` |
-| **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库选型在此落定** | **M4**：在真实 PR 上挂真质量闸门 |
+| **M3 完整 PR** | push + 开 PR + merge 全链路；**D4 目标仓库 = `wintim1143/pr-agent-e2e`（已定）** | **M4**：在真实 PR 上挂真质量闸门 |
 | **M4 真闸门** | `npm test` 真跑 / `git diff` 真喂 review / commitlint 真校验（替换 LLM 自评） | **M5**：把闸门扩展到多仓库 + GitHub App 鉴权 |
 | **M5 多仓库** | RepoTarget 多仓库、GitHub App 鉴权、幂等防重触发 | **M6**：在稳定的多仓库上做可观测与成本 |
 | **M6 可观测** | run 追踪、成本回写、失败重试与告警 | （终点） |
@@ -87,9 +93,11 @@
 milestones/
 ├── README.md                          ← 本文件：总路线图
 ├── _template-里程碑卡.md                ← 新里程碑照此模板建（🟦/🟨 分层）
-├── M1-只读洞察闭环.md                   ← 当前里程碑卡（索引 + 十节文本）
-├── M1-只读洞察闭环-flow.md              ← M1 数据流向图（Mermaid 流程图/时序图）
-└── M2-<名称>.md / M2-<名称>-flow.md     ← 后续按 M2/M3... 递增，章图可拆独立文件
+├── 验证手册.md                          ← 三态验证矩阵（脚本直验 / HTTP / 人工）
+├── M1-只读洞察闭环.md / -flow.md        ← ✅ 已完成
+├── M2-本地写入闭环.md / -flow.md        ← ✅ 已完成（2026-09-15 归档）
+├── M2-人工验收手册.md                   ← M2 的复现手册（已验收，保留作复现用）
+└── M3-完整PR闭环.md / -flow.md          ← 🟡 当前里程碑
 ```
 
 单个里程碑卡统一包含十节（🟦=定义期必填，🟨=实施期渐进补全）：
