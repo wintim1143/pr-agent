@@ -432,17 +432,19 @@ export interface PushPrResult {
 
 /**
  * push-open-pr 步:把当前分支推到 origin 并开 PR。
- * - 未配置 GitHub(token 缺失或无法解析 owner/repo)→ 返回 { prNumber:0, skipped:true }
- * - 工作树脏(commit 步没提交成功)→ 用 commitMessage 兜底补一个提交
- * - 没有任何领先 base 的提交 → 返回 { prNumber:0, error:'no-commits-to-push' }(PR 会是空的)
- * - 失败(推送/开 PR 异常)→ 返回 { prNumber:0, error:<原因> },不抛
+ * - 未配置 GitHub(token 缺失或无法解析 owner/repo)→ 返回 `{ prNumber:0, skipped:true }`
+ * - **工作树脏 → 返回 `{ error:'dirty-worktree' }`,不再兜底补提交**(2026-09-15 · M3-3 变更)
+ * - 没有任何领先 base 的提交 → 返回 `{ prNumber:0, error:'no-commits-to-push' }`(PR 会是空的)
+ * - 失败(推送/开 PR 异常)→ 返回 `{ prNumber:0, error:<原因> }`,**本函数不抛**
+ *   —— 「返回结构化结果」与「是否阻断流程」是两件事:adapter 只如实报告,
+ *   由编排层(`dev-workflow` 的 push-open-pr 步)决定要不要 throw。
+ *   这样 adapter 可被非编排场景复用(比如只查询状态),不会因为设计成「必抛」而失去复用性。
  */
 export async function githubPushAndOpenPR(opts: {
   branch: string;
   title: string;
   body: string;
   baseBranch?: string;
-  commitMessage?: string;
 }): Promise<PushPrResult> {
   const cfg = getGithubConfig();
   if (!cfg) {
@@ -453,12 +455,23 @@ export async function githubPushAndOpenPR(opts: {
   const base = opts.baseBranch || cfg.baseBranch;
 
   try {
-    // 1) 兜底提交:工作树脏则补一个提交,保证 PR 非空
+    // 1) 工作树必须干净 —— 脏 = commit 步可能已失败。M3 起**不再兜底补提交**。
+    //
+    // ## 为什么移除兜底(2026-09-15 · M3-3)
+    // M2 的兜底是为了「保证 PR 非空」:工作树脏就自动补一个提交,让 PR 有内容可发。
+    // 但那会**静默掩盖 commit 闸门的失败**:commit 步挂掉 → 工作树自然是脏的 →
+    // 兜底自动补一个 `chore: auto-dev <branch>` 提交 → PR 照开,
+    // 闸门给的 `request-changes`/判负被吞掉,人工看到的却是一条「看起来正常」的 PR。
+    // M3 会真写远端,推上去的提交无法撤回 —— 宁可显式失败,也不替模型兜底。
+    // (M3 卡 §10 异常表:影响远端的失败必须显式阻断,不得降级为「跳过继续」)
     if (isDirty(root)) {
-      const cr = gitCommit(opts.commitMessage || `chore: auto-dev ${branch}`, root);
-      if (!cr.committed) {
-        return { prNumber: 0, prUrl: null, error: `git-commit-failed: ${cr.error ?? 'unknown'}` };
-      }
+      return {
+        prNumber: 0,
+        prUrl: null,
+        error:
+          'dirty-worktree: 工作树有未提交改动,commit 步可能已失败。' +
+          'M3 起不再兜底补提交(兜底会掩盖闸门判负),请先排查 commit 步。',
+      };
     }
     // 2) 是否有领先 base 的提交
     const ahead = countAhead(root, base, branch);
@@ -466,8 +479,23 @@ export async function githubPushAndOpenPR(opts: {
       return { prNumber: 0, prUrl: null, error: 'no-commits-to-push' };
     }
     // 3) 推送(用 token 内嵌 HTTPS URL,不依赖 SSH / credential helper / gh)
+    //
+    //    ⚠️ 代理只在**调用点**注入:`git -c http.proxy=<GIT_PROXY>`(见 M3 卡 §7 M3-3)。
+    //    - **为什么要代理**:本机直连 `github.com`(clone/push 的实际端点)不通,
+    //      而 `api.github.com` 直连通 → 造成「REST 一直好用、git 一直不好用」的分裂现象。
+    //      并非所有环境都需要,所以由 `GIT_PROXY` 开关控制,不配就不加参数。
+    //    - **为什么 adapter 不给缺省值**:代理是**某台机器在某段时间的网络现状**,
+    //      不是项目的属性。缺省值由调用方(验证脚本)提供,adapter 只负责「配了就走」。
+    //    - **为什么用 -c 配置而非环境变量**:git 的 `http.proxy` **配置优先级高于**
+    //      `http_proxy`/`HTTPS_PROXY`(`http.c` 中 config 命中后不再读 env),
+    //      所以调用点注入能覆盖 shell 里挂着的坏代理;而写进 `.git/config` 属持久化,故不做。
     const tokenUrl = `https://x-access-token:${cfg.token}@github.com/${cfg.owner}/${cfg.repo}.git`;
-    execFileSync('git', ['push', tokenUrl, `HEAD:refs/heads/${branch}`], {
+    const pushArgs = ['push', tokenUrl, `HEAD:refs/heads/${branch}`];
+    const proxy = process.env.GIT_PROXY?.trim();
+    if (proxy) {
+      pushArgs.unshift('-c', `http.proxy=${proxy}`);
+    }
+    execFileSync('git', pushArgs, {
       cwd: root,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       stdio: 'pipe',

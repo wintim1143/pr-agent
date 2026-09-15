@@ -216,10 +216,65 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
 - ⚠️ **git 调用需在调用点注入代理**（见 M3-3）：`CODING_REPO_ROOT` 的那份 clone 要能被 push，而本机直连 `github.com` 不通。
   **不写任何持久化代理配置**，由脚本每次调用加 `-c http.proxy=<GIT_PROXY>`
 
-### M3-3 push-open-pr 真跑打通
+### M3-3 push-open-pr 真跑打通 ✅ **已完成（2026-09-15）**
 - 内容：跑通 `git push`（token 内嵌 HTTPS）+ REST 开 PR；处理已存在 PR 的复用分支
 - 验收：远端出现 `feat/<n>-<slug>` 分支；REST 返回 PR number + html_url
 - 注意：现有实现里 `githubPushAndOpenPR` 有「工作树脏则兜底补提交」逻辑 —— 需确认它在 M3 下不会掩盖 commit 步的失败（**兜底提交应当降级为显式报错**，否则 commit 闸门失败会被静默绕过）
+
+#### 实跑结论（真写远端）
+
+| AC | 判据 | 实测结果 |
+|---|---|---|
+| **AC-1** | `git ls-remote origin feat/<n>-<slug>` 有输出 | ✅ `a07bb2f…  refs/heads/feat/1-add-install-section` |
+| **AC-2** | REST 返回 `number` + `html_url`，状态 open | ✅ **PR #1** → `https://github.com/wintim1143/pr-agent-e2e/pull/1`（state=open；head `feat/1-add-install-section` → base `main`） |
+| **AC-4** | run `status=suspended`、`waitingFor=merge-approval` | ✅ `status=suspended`（停在 merge 关卡等人 approve） |
+
+- `runId = 9bfc3dc3-e228-4b99-9c26-ef8c074c8ca6`（**M3-5 的 resume 要用它**）
+- 全流程 **116s**：checkout 4.1s / coding 60.3s / test 8.5s / review 7.0s / commit 12.6s / **push-open-pr 12.2s** / notify 1.1s / merge→suspend
+- 三闸门全部 **attempt=1 零重试**：`test.passed=true`、`review.decision=approve`、`commit.message=docs(readme): add install section…`
+- **代理注入生效的直接证据**：`push-open-pr` 只用 **12.2s** 就完成。若未走代理，本机直连 `github.com` 会 **21s 超时**后才失败 —— 所以「12.2s 成功」本身就是代理生效的判据
+
+#### 三处代码变更（都是「不做就会静默出错」级别）
+
+1. **`adapters/github.ts` 的 `git push` 加调用点代理注入**
+   ```ts
+   const pushArgs = ['push', tokenUrl, `HEAD:refs/heads/${branch}`];
+   const proxy = process.env.GIT_PROXY?.trim();
+   if (proxy) pushArgs.unshift('-c', `http.proxy=${proxy}`);
+   ```
+   adapter **不给缺省值**：代理是「某台机器在某段时间的网络现状」，不是项目属性。
+   缺省值（7890）由调用方提供，adapter 只负责「配了就走」。
+2. **移除「工作树脏则兜底补提交」→ 显式报错 `dirty-worktree`**
+   M2 的兜底本意是「保证 PR 非空」，但它会**静默掩盖 commit 闸门的失败** ——
+   commit 步挂掉 → 工作树自然脏 → 兜底补一个 `chore: auto-dev <branch>` → PR 照开，
+   闸门的判负被吞掉，人工看到的却是一条「看起来正常」的 PR。M3 真写远端，推上去撤不回来。
+   顺带删掉因此失效的 `commitMessage` 入参（留着会让人以为还有兜底行为）。
+3. **`dev-workflow.ts` 的 push-open-pr 步：`res.error` 从「仅告警」改为 `throw`**
+   推不动远端却继续往下走，会走到 merge 步并 suspend —— 那是**一个永远不会被点掉的挂起**
+   （根本没有 PR 可合）。§10 定调：影响远端的失败必须显式阻断。
+
+> **刻意保留的职责边界**：adapter 仍**不抛**，只返回 `{error}` 结构化结果，由编排层决定是否 throw。
+> 「如实报告」与「是否阻断流程」是两件事 —— adapter 这样才可被「只查状态、不希望抛错」的场景复用。
+
+#### 验证脚本新增两项能力
+
+- `--run`：完整八步（**不传 `stopAfterCommit`**）→ 真 push / 真开 PR / 停在 merge 关卡
+- `--clean-remote`：清理远端 `feat/*` 分支与对应 open PR
+  - **顺序必须先关 PR 再删分支**：反了会让 PR 落进「head 分支已被删除」的悬空状态，
+    GitHub 不会自动关它，会一直挂在 open 列表里成为噪音
+  - ⚠️ **重跑前必须用**：`--reset` 只清本地，远端残留分支会让下次 push 变成**非快进被拒**
+    （本地分支从 base 重建，远端却已多一个提交）→ 每跑第二次必挂
+
+#### 单测锁
+
+`test/mastra/github-adapter.test.ts` 新增 2 条（共 99 条全绿）：
+- `工作树脏 → 返回 dirty-worktree，且不产生任何兜底提交`
+  —— **第二个断言是关键**：只断言「返回了 error」不够，「返回错误但顺手补了提交」同样会污染远端，
+  故用 `git rev-list --count --all === 0` 证明没有新提交
+- `未配置 token → skipped（不触发任何 git 操作）`
+- 📌 造脏工作树必须 `git add` —— `isDirty()` 查的是 `git diff --cached` 与 `git diff`，
+  **未跟踪文件不算脏**，只写文件不 add 是造不出来的
+
 - ⚠️ **`git push` 必须经 HTTP 代理**（2026-09-15 实测，环境级约束）：
   | 目标 | 直连 | 结果 |
   |---|---|---|
@@ -272,12 +327,12 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
 > 定义期先列预期判据，实施到对应阶段再按实际端点 / 字段校准。
 > **验证方式列是强制的**：写清「由哪个脚本 / 手工动作判定，证据落在哪个文件」。
 
-| # | 验收项 | 判据 | 验证方式 · 证据位置 |
-|---|---|---|---|
-| AC-1 | feature 分支真推到远端 | `git ls-remote origin feat/<n>-<slug>` 有输出 | `verify-pr-loop.js` 打印；证据 `logs/m3-verify.log` |
-| AC-2 | PR 真开 | REST 返回 `number` + `html_url`；网页可见，状态 open | 脚本打印 + **人工去 GitHub 看** |
-| AC-3 | PR 内容正确 | `head` = feature 分支、`base` = main、body 含 test/review 结论 | REST 查询 + 人工看 PR 描述 |
-| AC-4 | merge 关卡真挂起 | run `status = suspended`、`waitingFor = merge-approval`；此时 PR **仍 open** | 脚本打印 + `GET /api/workflows/dev-workflow/runs/<id>` |
+| # | 验收项 | 判据 | 验证方式 · 证据位置 | 实测（M3-3） |
+|---|---|---|---|---|
+| AC-1 | feature 分支真推到远端 | `git ls-remote origin feat/<n>-<slug>` 有输出 | `verify-pr-loop.js` 打印；证据 `logs/m3-verify.log` | ✅ `a07bb2f… refs/heads/feat/1-add-install-section` |
+| AC-2 | PR 真开 | REST 返回 `number` + `html_url`；网页可见，状态 open | 脚本打印 + **人工去 GitHub 看** | ✅ **PR #1** open（脚本自动核对） |
+| AC-3 | PR 内容正确 | `head` = feature 分支、`base` = main、body 含 test/review 结论 | REST 查询 + 人工看 PR 描述 | ✅ head `feat/1-add-install-section` → base `main`；body 含完整 **测试/审核/commit** 三段结论（`+7/-0`，1 文件） |
+| AC-4 | merge 关卡真挂起 | run `status = suspended`、`waitingFor = merge-approval`；此时 PR **仍 open** | 脚本打印 + `GET /api/workflows/dev-workflow/runs/<id>` | ✅ `status=suspended`，PR 同时保持 open |
 | AC-5 | 未批准不合并 | `resume({approved:false})` 后 PR 保持 open、base 分支 sha 未变 | 脚本打印 + 人工核对 |
 | AC-6 | 批准后真 merge | `resume({approved:true})` 后 PR `state=closed` / `merged=true`；base 分支出现 squash commit | REST 查询 + **人工去 GitHub 看 Merged 标记** |
 | AC-7 | 飞书卡片真推送 | 群里收到卡片；`feishuNotify` 返回 `ok:true` | **人工去飞书群看** + 脚本打印 |
@@ -500,4 +555,60 @@ M3 最危险的失败形态**不是「跑不通」，而是「跑通了但打在
     → 本机直连 `github.com` 不通，直接跑必挂。需加 `-c http.proxy=${process.env.GIT_PROXY}`，同时把
     「工作树脏则兜底补提交」（`:434`）改为显式报错（否则 commit 闸门失败会被静默绕过）
   - ⬜ `--run` 分支目前显式 `exit(3)`，待 M3-3 接通 workflow 后启用
+  - ⬜ 本轮改动**未提交**（等用户指令）
+
+---
+
+### 2026-09-15 · M3-3 push-open-pr 真跑打通 ✅（真写远端 · 3/3 通过）
+
+- **本节一句话**：**第一次真的把分支推到远端、真的开出了 PR，并且真的停在了人工关卡上。**
+  PR #1 · `https://github.com/wintim1143/pr-agent-e2e/pull/1`。`runId = 9bfc3dc3-e228-4b99-9c26-ef8c074c8ca6`
+
+- **改了哪些文件**
+  | 文件 | 改动 | 性质 |
+  |---|---|---|
+  | `src/mastra/adapters/github.ts` | `git push` 加 `-c http.proxy=$GIT_PROXY` 调用点注入 | **重点模块** |
+  | `src/mastra/adapters/github.ts` | 移除「工作树脏则兜底补提交」→ 返回 `dirty-worktree`；删掉因此失效的 `commitMessage` 入参 | **行为变更** |
+  | `src/mastra/workflows/dev-workflow.ts` | push-open-pr 步 `res.error` 从「仅告警」改为 `throw` | **行为变更** |
+  | `scripts/verify-pr-loop.js` | 实现 `--run`（完整八步 + AC-1/2/4 判定）；新增 `--clean-remote` | 验证基建 |
+  | `test/mastra/github-adapter.test.ts` | 新增 2 条 dirty-worktree 用例；`makeRepo` 提到模块层级共用 | 行为变更锁 |
+
+- **本轮核实的既有事实**
+  - 代理注入实测生效：`push-open-pr` 步 **12.2s 完成**。若未走代理，本机直连 `github.com` 会先 **21s 超时**再失败 ——
+    所以「12.2s 成功」本身就是判据，比事后查配置更直接
+  - 三闸门**零重试**（全 attempt=1），且 test 的判定文本里出现 `+7 行`、```` ```bash ```` 代码块、
+    真实 clone URL —— 再次证明 M2 收尾时补的「喂 diff」持续有效，闸门不是盲评
+  - `openPrForBranch` 的「已有 open PR 则复用」逻辑本轮未触发（靶场当时无 PR），属未覆盖面
+
+- **踩坑 / 设计取舍**
+  - **adapter 不给代理缺省值**：缺省 `7890` 留在脚本里。理由是「代理是某台机器在某段时间的网络现状，不是项目属性」——
+    写进 adapter 等于把本机网络拓扑固化进产品代码，换机器即失效还需改源码
+  - **adapter 仍不抛、由编排层 throw**：刻意保留。「如实报告」与「是否阻断流程」是两件事，
+    这样 adapter 在「只查状态、不希望抛错」的场景仍可复用
+  - **`--clean-remote` 顺序：先关 PR 再删分支**。反了会让 PR 落进「head 分支已被删除」的悬空状态，
+    GitHub 不会自动关它 —— 会一直作为噪音挂在 open 列表里
+  - **`--reset` 与远端清理刻意分开**：本地清理是幂等的低风险动作，远端清理是破坏性的。
+    合成一个开关会让「只想清本地」的人意外删掉远端分支；代价是重跑前要记得多敲一个参数（已在脚本头显式警示）
+  - **造脏工作树必须 `git add`**：`isDirty()` 查 `git diff --cached` / `git diff`，
+    **未跟踪文件不算脏** —— 写文件不 add 造不出脏工作树，这条第一版写测试时踩了
+
+- **三层验证**
+  | 层 | 手段 | 结果 |
+  |---|---|---|
+  | 编译 | `node ./node_modules/mwtsc/bin/mwtsc.js --cleanOutDir` | ✅ rc=0 |
+  | 单测 | `node ./node_modules/jest/bin/jest.js` 全量 | ✅ **99/99**（M3-2 后 97 + 本轮 2） |
+  | 实跑 | `node scripts/verify-pr-loop.js --run` | ✅ **3/3**（AC-1 远端分支 / AC-2 PR 已开 / AC-4 停在关卡），116s |
+
+- **观察到的环境细节**
+  - `git push` 网络操作期间，git 会在 Windows 上调 `reg.exe` 读系统代理设置 → 被沙箱 **Program Blacklist 拦截**。
+    该拦截**不影响结果**（本轮 push 成功），因为我们已经用 `-c http.proxy=` 显式给了代理。
+    但排查时若看到这条 block 消息，不要误判为 push 失败原因
+  - 这也解释了此前「网络 git 仍弹授权」的观感：走的是网络层管控 + reg.exe 读取，与 `sandbox.versionControl` 无关
+
+- **待确认 / 下一步**
+  - ⬜ **M3-4**：`notify` 步实跑返回 `mode=app`（推送成功），但「飞书群里确实收到卡片」属人工验收，需人工确认
+  - ⬜ **M3-5（最高风险项）**：用 `runId=9bfc3dc3…` 调 `resume({approved:false})` / `resume({approved:true})`
+    验证关卡语义。⚠️ **本轮 run 已停在 suspended 且 PR 保持 open，正好可作 M3-5 的起点 —— 别提前 `--clean-remote`**
+  - ⬜ **M3-6**：红线扩展到远端维度（禁 force push / 禁推 base）
+  - ⬜ **M3-8**：`request-changes` 后不再 commit 的条件边
   - ⬜ 本轮改动**未提交**（等用户指令）

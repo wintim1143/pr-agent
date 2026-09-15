@@ -1,15 +1,17 @@
 /**
  * M3「完整 PR 闭环」端到端验证。
  *
- * ## 当前阶段（2026-09-15 · M3-2 已实现的部分）
- * 本轮先把「**目标仓库切换 + 前置检查**」这一层做实：
+ * ## 当前阶段（2026-09-15 · M3-2 ✅ / M3-3 ✅）
+ * **已实现**（前置检查 6 段 + 闭环 1 段）：
  *   1. **硬设五个 env**（`CODING_REPO_ROOT` / `GITHUB_OWNER` / `GITHUB_REPO` /
  *      `GITHUB_BASE_BRANCH` / `GIT_PROXY`），**不依赖外部 shell 环境**
  *      —— 与 `verify-local-write.js` 同一安全模式。这是防「静默打在 pr-agent 自己身上」的关键。
  *   2. **前置检查**：靶场 clone 就绪 / 有 origin remote / remote 指向与硬设值一致 /
  *      工作区干净 / token 两个写权限探针（零副作用）。
  *   3. **身份一致性反证**：证明 `parseOwnerRepo()` 不再解析成 `wintim1143/pr-agent`
- *      —— 这是 M3-2 的核心验收（修复前会把 PR 开到 pr-agent 身上）。
+ *      —— M3-2 的核心验收（修复前会把 PR 开到 pr-agent 身上）。
+ *   4. **`--run` 完整闭环**：真 push / 真开 PR / 停在 merge 关卡（M3-3）；
+ *      resume 与 merge 语义属 M3-5，本轮止于 `suspended`。
  *
  * ## 与 verify-local-write.js 的边界（别混用）
  * | | `verify-local-write.js`（M2） | 本脚本（M3） |
@@ -22,14 +24,18 @@
  * ## 为什么前置检查里要「比 remote 与硬设值一致」
  * M3 最危险的失败形态不是「跑不通」，而是「**跑通了但打在错的仓库上**」：
  * 靶场 clone 的 remote 若指向 `pr-agent`，push 会把分支推到主仓、PR 也开到主仓。
- * 这类错误不会报错，只会静默污染。所以这里做**双向核对**：
+ * 这类错误不会报错，只会静默污染。所以这里做**三方核对**：
  * 硬设的 owner/repo ↔ 靶场 remote 解析出的 owner/repo ↔ REST 实际能写到的仓库（写探针）。
  *
  * ## 用法
- *   node scripts/verify-pr-loop.js                # 前置检查（默认；不跑 workflow）
- *   node scripts/verify-pr-loop.js --reset        # 先重置靶场本地分支状态再检查
- *   node scripts/verify-pr-loop.js --run          # M3-3 起启用：跑完整闭环（当前显式报错）
- *   node scripts/verify-pr-loop.js --skip-probe   # 跳过 token 写权限探针（离线时用）
+ *   node scripts/verify-pr-loop.js                 # 前置检查（默认；不跑 workflow）
+ *   node scripts/verify-pr-loop.js --run           # 完整闭环：真 push / 真开 PR / 停在 merge 关卡
+ *   node scripts/verify-pr-loop.js --reset         # 先重置靶场**本地**分支状态再检查
+ *   node scripts/verify-pr-loop.js --clean-remote  # 清理靶场**远端** feat/* 分支与其 open PR
+ *   node scripts/verify-pr-loop.js --skip-probe    # 跳过 token 写权限探针（离线时用）
+ *
+ * ⚠️ **重跑须知**：`--reset` 只清本地。远端残留的 `feat/*` 分支会让下次 push 变成
+ * **非快进被拒**（本地分支从 main 重建，远端却已多一个提交）。重跑前先 `--clean-remote`。
  *
  * ## 环境覆盖（都有安全缺省，不设也能跑）
  *   M3_TARGET_REPO  靶场本地 clone 路径，缺省 `D:\code\pr-agent-e2e`
@@ -57,11 +63,13 @@ const PROXY = process.env.GIT_PROXY || process.env.M3_GIT_PROXY || 'http://127.0
 
 const PR_AGENT = path.resolve(__dirname, '..');
 const LOG = path.resolve(__dirname, '../logs/m3-verify.log');
+const PROGRESS_LOG = path.resolve(__dirname, '../logs/dev-workflow.log');
 
 const argv = process.argv.slice(2);
 const RESET = argv.includes('--reset');
 const RUN = argv.includes('--run');
 const SKIP_PROBE = argv.includes('--skip-probe');
+const CLEAN_REMOTE = argv.includes('--clean-remote');
 
 const lines = [];
 function log(...a) {
@@ -85,6 +93,27 @@ function git(cwd, ...args) {
     const stderr = (e.stderr || '').toString().trim();
     return stderr || `<<git 失败: ${e.message}>>`;
   }
+}
+
+/**
+ * 网络 git：需要走 `github.com` 端点的操作（`ls-remote` / `fetch` / `push`）。
+ *
+ * 与 `git()` 的区别**只有**一个：在调用点注入 `-c http.proxy=<PROXY>`。
+ * 为什么不配全局 / 仓库级：代理是本机某段时间的网络现状，不是项目属性，
+ * 写进 `.git/config` 换机器即失效，且故障表现为「git 静默连不通」这种最难排查的形态。
+ * （git 的 `http.proxy` 配置优先级高于 `http_proxy`/`HTTPS_PROXY` 环境变量，故能覆盖坏 env。）
+ */
+function gitNet(cwd, ...args) {
+  return git(cwd, '-c', `http.proxy=${PROXY}`, ...args);
+}
+
+/** 让 promise 在规定 ms 内未决议则抛错 —— 防 CLI/LLM 挂起导致脚本静默冻死。 */
+function withGuard(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`GUARD_TIMEOUT@${label}: 超过 ${ms}ms 未返回`)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
 const failures = [];
@@ -140,6 +169,81 @@ async function probeWritePermission(kind) {
     message: raw && (raw.message || JSON.stringify(raw.errors || {})) ,
     acceptedPermissions: accepted,
   };
+}
+
+/** 查某 head 分支当前 open 的 PR（用于验证 push-open-pr 真的开出了 PR） */
+async function getOpenPr(branch) {
+  const resp = await fetch(
+    `https://api.github.com/repos/${OWNER}/${REPO}/pulls?state=open&head=${encodeURIComponent(
+      `${OWNER}:${branch}`
+    )}`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    }
+  );
+  const list = await resp.json().catch(() => null);
+  return { status: resp.status, list: Array.isArray(list) ? list : null };
+}
+
+/** 关闭 PR（`PATCH /pulls/{n}` body `{state:'closed'}`）。返回 HTTP 状态码。 */
+async function closePr(n) {
+  const resp = await fetch(`https://api.github.com/repos/${OWNER}/${REPO}/pulls/${n}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ state: 'closed' }),
+  });
+  return resp.status;
+}
+
+/**
+ * `--clean-remote`：清理靶场远端的 `feat/*` 分支与它们 open 的 PR。
+ *
+ * ## 为什么必须有这个开关
+ * 靶场 clone 的 feature 分支是**每次跑 workflow 时从 base 新建**的。
+ * 若远端还留着上一轮的 `feat/1-*`，下一轮 push 时本地分支是远端的**祖先**
+ * → git 判非快进并拒收（`! [rejected] (fetch first)`）→ 每跑第二次必挂。
+ * 而 `--reset` 只清本地（刻意如此：远端操作破坏性更强），所以清理必须是独立开关。
+ *
+ * ## 顺序为什么是「先关 PR 再删分支」
+ * 反过来会让 PR 落进「head 分支已被删除」的悬空状态 ——
+ * GitHub 不会自动关它，会一直挂在 open 列表里成为噪音。
+ */
+async function cleanRemote() {
+  log('\n[--clean-remote] 清理靶场远端的 feat/* 分支与对应 open PR');
+  const ls = gitNet(TARGET, 'ls-remote', '--heads', 'origin', 'refs/heads/feat/*');
+  if (!ls || ls.startsWith('<<git 失败') || !ls.trim()) {
+    log('  远端无 feat/* 分支（或 ls-remote 失败），无需清理');
+    return;
+  }
+  const branches = ls
+    .split('\n')
+    .map(l => (l.split('\t')[1] || '').replace('refs/heads/', ''))
+    .filter(Boolean);
+  const tokenUrl = `https://x-access-token:${process.env.GITHUB_TOKEN}@github.com/${OWNER}/${REPO}.git`;
+
+  for (const b of branches) {
+    // 1) 先关 open PR
+    try {
+      const { list } = await getOpenPr(b);
+      for (const pr of list || []) {
+        log(`    关闭 PR #${pr.number}(${b})→ HTTP ${await closePr(pr.number)}`);
+      }
+    } catch (e) {
+      log(`    查/关 PR 失败(${b}): ${e?.message || e}`);
+    }
+    // 2) 再删远端分支（走代理；token 内嵌 URL，不落 .git/config）
+    const del = gitNet(TARGET, 'push', tokenUrl, '--delete', b);
+    log(`    删除远端分支 ${b} → ${del || 'ok'}`);
+  }
 }
 
 (async () => {
@@ -309,13 +413,128 @@ async function probeWritePermission(kind) {
   }
   log(`\n=== ✅ 前置检查全部通过（耗时 ${elapsed}s）===`);
 
+  if (CLEAN_REMOTE) {
+    await cleanRemote();
+  }
+
   if (!RUN) {
-    log('\n下一步: `--run` 跑完整闭环（真 push / 真开 PR / merge 关卡）。');
-    log('当前 M3-2 阶段仅实现前置检查；--run 自 M3-3 起启用。');
+    log('\n下一步: 加 --run 跑完整闭环(真 push / 真开 PR / 停在 merge 关卡等人 approve)。');
     process.exit(0);
   }
-  log('\n--run 尚未实现（M3-3 起启用：push-open-pr 真跑 + suspend/resume 关卡）。');
-  process.exit(3);
+
+  // ---------- 7. 完整闭环（--run）----------
+  // 与 M2 的关键差别:**不传 stopAfterCommit** → 恢复完整八步,
+  // push-open-pr 真推远端、notify 真发卡片、merge 步 suspend 等人工 approve。
+  log('\n[7/7] 跑 dev-workflow(完整八步,不传 stopAfterCommit)');
+  const { mastra } = require(path.resolve(__dirname, '../dist/mastra/index.js'));
+  const wf = mastra.getWorkflow('dev-workflow');
+  const run = await wf.createRun();
+  log(`  runId = ${run.runId}`);
+
+  const issue = {
+    issueNumber: 1,
+    issueTitle: 'add-install-section',
+    issueBody:
+      '请在 README.md 中新增一节「## 安装」,内容包含两条命令:' +
+      '`git clone <仓库地址>` 与 `npm install`。不要改动除 README.md 以外的任何文件。',
+  };
+  const totalGuardMs = Number(process.env.VERIFY_TOTAL_GUARD_MS ?? 900_000);
+  log(`  issue = #${issue.issueNumber} ${issue.issueTitle}`);
+  log(`  → start() 中(总守卫 ${Math.round(totalGuardMs / 1000)}s)...`);
+  log('  ⏱  实时进度: 另开终端执行  tail -f logs/dev-workflow.log');
+
+  // 心跳:与 verify-local-write.js 同一套做法 —— 长等待期能看到走到了哪一步。
+  const hbMs = Number(process.env.VERIFY_HEARTBEAT_MS ?? 30_000);
+  let hbTimer;
+  if (hbMs > 0) {
+    hbTimer = setInterval(() => {
+      const elapsedSec = ((Date.now() - t0) / 1000).toFixed(0);
+      let lastStage = '';
+      try {
+        const evts = fs.readFileSync(PROGRESS_LOG, 'utf8').trim().split('\n');
+        const last = JSON.parse(evts[evts.length - 1]);
+        lastStage = ` | 最新阶段: ${last.stage || '-'} ${last.event}`;
+      } catch {
+        /* 日志还没生成,忽略 */
+      }
+      log(`  ⏳ 仍在运行 ${elapsedSec}s${lastStage}`);
+    }, hbMs);
+  }
+
+  let result;
+  try {
+    result = await withGuard(run.start({ inputData: issue }), totalGuardMs, 'workflow');
+  } catch (e) {
+    if (hbTimer) clearInterval(hbTimer);
+    log('\n✗ workflow 抛错:', e?.message || e);
+    log('  → 若错误含 dirty-worktree / no-commits-to-push,说明 M3-3 的显式阻断生效(这是预期行为,不是 bug)');
+    log('  → 若为超时,检查 ~/.claude/settings.json 的编码代理端点是否可用');
+    process.exit(1);
+  }
+  if (hbTimer) clearInterval(hbTimer);
+  log(`  status = ${result.status}`);
+
+  // 取出关键步骤输出
+  const stepOut = id => {
+    const s = (result.steps && result.steps[id]) || (result.results && result.results[id]);
+    return (s && s.output) || {};
+  };
+  const branch = stepOut('checkout').branch || '';
+  const prNumber = stepOut('push-open-pr').prNumber ?? 0;
+  const commitMsg = stepOut('commit').commitResult?.message;
+  log(`  commit.message = ${commitMsg ? String(commitMsg).slice(0, 80) : '(空)'}`);
+  log(`  branch = ${branch || '(空)'}`);
+  log(`  prNumber = ${prNumber}`);
+  log(`  runId = ${run.runId}(M3-5 resume 时要用它)`);
+
+  // AC-1: 远端真出现该分支
+  log('\n[额外] 远端证据核对');
+  let ac1Ok = false;
+  if (branch) {
+    const ls = gitNet(TARGET, 'ls-remote', '--heads', 'origin', `refs/heads/${branch}`);
+    ac1Ok = !!ls && !ls.startsWith('<<git 失败') && ls.includes(`refs/heads/${branch}`);
+    log(`  ${ac1Ok ? '✅' : '❌'} AC-1 远端分支: ${ls || '(空)'}`);
+  } else {
+    log('  ❌ AC-1 无法判定: 未取到 branch');
+  }
+
+  // AC-2: PR 真开（REST 查询，不依赖 Mastra 返回结构）
+  let ac2Ok = false;
+  let prUrl = '';
+  if (branch && process.env.GITHUB_TOKEN) {
+    try {
+      const { status, list } = await getOpenPr(branch);
+      if (list && list.length > 0) {
+        ac2Ok = true;
+        prUrl = list[0].html_url || '';
+        log(`  ✅ AC-2 PR 已开: #${list[0].number} ${prUrl}(state=${list[0].state})`);
+        log(`        head=${list[0].head?.ref} → base=${list[0].base?.ref}`);
+      } else {
+        log(`  ❌ AC-2 查不到 open PR（HTTP ${status}）`);
+      }
+    } catch (e) {
+      log(`  ❌ AC-2 查询异常: ${e?.message || e}`);
+    }
+  }
+
+  // AC-4: 停在 merge 关卡
+  const suspended = result.status === 'suspended';
+  log(
+    `  ${suspended ? '✅' : '❌'} AC-4 run 停在 merge 关卡: status=${result.status}` +
+      (suspended ? '(等待人工 approve)' : '')
+  );
+
+  // 本轮不 resume —— merge 关卡的人工确认属 M3-5。
+  log('\n[本轮不 resume] merge 人工关卡属 M3-5,本次止于 suspended 状态。');
+  if (prUrl) {
+    log(`  该 PR 现在 open 且未合并,可在 GitHub 上人工查看: ${prUrl}`);
+  }
+  log(`  下一步(M3-5): 用 runId=${run.runId} 调 resume({approved:false / true}) 验证关卡语义`);
+  log('  注意: resume 需要同一 LibSQLStore(mastra.db)与同一进程外入口,见 M3 卡 §7 M3-5');
+
+  const okCount = [ac1Ok, ac2Ok, suspended].filter(Boolean).length;
+  log(`\n=== --run 判定: ${okCount}/3 通过(AC-1 远端分支 / AC-2 PR 已开 / AC-4 停在关卡) ===`);
+  process.exit(okCount === 3 ? 0 : 2);
 })().catch(e => {
   log('✗ 未捕获异常:', e?.message || e);
   log(e?.stack || '');

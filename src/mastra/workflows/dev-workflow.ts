@@ -492,11 +492,16 @@ const pushOpenPr = createStep({
         branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
         title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
         body: buildPrBody(inputData),
-        commitMessage: inputData.commitResult?.message,
       });
       if (res.error) {
-        console.warn('[push-open-pr] 开 PR 失败:', res.error);
+        // ⚠️ M3 起**显式阻断**,不再只 console.warn 后继续往下走。
+        // 原因(2026-09-15 · M3-3):推不动远端却继续,流程会走到 merge 步并
+        // suspend 等人 approve —— 那是一个**永远不会被点掉的挂起**(根本没有 PR 可合)。
+        // 静默失败比崩溃更难排查:M2 零远端时「继续」的代价只是白跑一遍,
+        // M3 真写远端后,判断依据(有没有 PR)与流程状态(等 approve)会互相矛盾。
+        // M3 卡 §10 异常表:影响远端的失败必须显式阻断,不得降级为「仅告警」。
         p.fail(res.error);
+        throw new Error(`[push-open-pr] 失败: ${res.error}`);
       } else if (res.skipped) {
         console.warn('[push-open-pr] 未配置 GitHub,已跳过');
         p.done({ skipped: true });

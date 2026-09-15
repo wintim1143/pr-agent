@@ -1,10 +1,11 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   getGithubConfig,
   githubMergePR,
+  githubPushAndOpenPR,
   parseOwnerRepo,
 } from '../../src/mastra/adapters/github';
 
@@ -22,6 +23,37 @@ function mockFetchOnce(status: number, body: unknown) {
   }) as typeof fetch;
   return { calls, restore: () => (global.fetch = orig) };
 }
+
+/**
+ * 临时 git 仓库工厂 —— 供 `parseOwnerRepo` 与 `githubPushAndOpenPR` 的用例共用。
+ *
+ * ## 为什么真造仓库而不是 mock execFileSync
+ * 这两处的 bug 都出在「git 命令落在**哪个 cwd**」这种**环境语义**上。
+ * mock 掉 git 等于把被测行为一起 mock 了 —— 测试会永远绿，且绿得毫无意义。
+ * 真仓库的成本只是 `git init`（毫秒级），换来的是真能复现一次 cwd 错位。
+ */
+const TMP_REPOS: string[] = [];
+
+/** 造一个临时 git 仓库；remoteUrl 非空时给它加 origin */
+function makeRepo(remoteUrl?: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pr-agent-owner-'));
+  TMP_REPOS.push(dir);
+  execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
+  if (remoteUrl) {
+    execFileSync('git', ['remote', 'add', 'origin', remoteUrl], { cwd: dir, stdio: 'pipe' });
+  }
+  return dir;
+}
+
+afterEach(() => {
+  while (TMP_REPOS.length) {
+    try {
+      rmSync(TMP_REPOS.pop()!, { recursive: true, force: true });
+    } catch {
+      /* Windows 偶发文件锁,忽略 —— 是临时目录,不影响判定 */
+    }
+  }
+});
 
 const BASE_ENV: Record<string, string | undefined> = {};
 beforeAll(() => {
@@ -129,29 +161,6 @@ describe('githubMergePR', () => {
  * 而**不是**进程 cwd 的仓库。这一条挂了就说明 bug 复现了。
  */
 describe('parseOwnerRepo（cwd 语义 · M3-2 回归）', () => {
-  const cleanup: string[] = [];
-
-  /** 造一个临时 git 仓库；remoteUrl 非空时给它加 origin */
-  function makeRepo(remoteUrl?: string): string {
-    const dir = mkdtempSync(join(tmpdir(), 'pr-agent-owner-'));
-    cleanup.push(dir);
-    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'pipe' });
-    if (remoteUrl) {
-      execFileSync('git', ['remote', 'add', 'origin', remoteUrl], { cwd: dir, stdio: 'pipe' });
-    }
-    return dir;
-  }
-
-  afterEach(() => {
-    while (cleanup.length) {
-      try {
-        rmSync(cleanup.pop()!, { recursive: true, force: true });
-      } catch {
-        /* Windows 偶发文件锁,忽略 —— 是临时目录,不影响判定 */
-      }
-    }
-  });
-
   it('HTTPS remote(带 .git 后缀)→ 正确解析且剥掉后缀', () => {
     const dir = makeRepo('https://github.com/wintim1143/pr-agent-e2e.git');
     expect(parseOwnerRepo(dir)).toEqual({ owner: 'wintim1143', repo: 'pr-agent-e2e' });
@@ -194,5 +203,72 @@ describe('parseOwnerRepo（cwd 语义 · M3-2 回归）', () => {
     process.env.GITHUB_OWNER = 'someone-else';
     process.env.GITHUB_REPO = 'other-repo';
     expect(getGithubConfig()).toMatchObject({ owner: 'someone-else', repo: 'other-repo' });
+  });
+});
+
+/** 数一个仓库的提交总数；空仓库（0 commit）时 git 会报错，语义上即 0 */
+function commitCount(dir: string): number {
+  try {
+    return Number(
+      execFileSync('git', ['rev-list', '--count', '--all'], {
+        cwd: dir,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim()
+    );
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * `githubPushAndOpenPR` 的「工作树脏」行为 —— M3-3 的**行为变更锁**。
+ *
+ * ## 锁的是什么
+ * M2 的实现会在工作树脏时**兜底补一个提交**（`chore: auto-dev <branch>`），
+ * 目的是「保证 PR 非空」。副作用是**静默掩盖 commit 闸门的失败**：
+ * commit 步挂掉 → 工作树自然是脏的 → 兜底自动补提交 → PR 照开，
+ * 闸门给的 `request-changes`/判负被吞掉，人工看到的却是一条「看起来正常」的 PR。
+ *
+ * M3 起改成**显式报错**。下面两条把新行为钉死，其中第 1 条的第二个断言是关键：
+ * **必须证明没有产生兜底提交** —— 只断言「返回了 error」是不够的，
+ * 「返回错误、但顺手补了一个提交」同样会污染远端。
+ *
+ * 注：`isDirty()` 查的是 `git diff --cached --quiet`（暂存区）与 `git diff --quiet`（工作区），
+ * **未跟踪文件不算脏** —— 所以造脏工作树必须 `git add`，只写文件是不行的。
+ */
+describe('githubPushAndOpenPR（工作树脏 → 显式失败 · M3-3）', () => {
+  /** 造一个「有暂存改动」的仓库 */
+  function makeDirtyRepo(): string {
+    const dir = makeRepo('https://github.com/wintim1143/pr-agent-e2e.git');
+    writeFileSync(join(dir, 'dirty.txt'), 'hello\n');
+    execFileSync('git', ['add', 'dirty.txt'], { cwd: dir, stdio: 'pipe' });
+    return dir;
+  }
+
+  it('工作树脏 → 返回 dirty-worktree，且**不产生任何兜底提交**', async () => {
+    const dir = makeDirtyRepo();
+    process.env.CODING_REPO_ROOT = dir;
+    process.env.GITHUB_TOKEN = 't';
+    process.env.GITHUB_OWNER = 'wintim1143';
+    process.env.GITHUB_REPO = 'pr-agent-e2e';
+
+    const res = await githubPushAndOpenPR({ branch: 'feat/1-x', title: 'x', body: 'y' });
+
+    expect(res.prNumber).toBe(0);
+    expect(res.error).toMatch(/dirty-worktree/);
+    // 关键：不只看返回值 —— 还要证明没有悄悄补提交（否则远端照样被污染）
+    expect(commitCount(dir)).toBe(0);
+  });
+
+  it('未配置 token → skipped（不触发任何 git 操作，也不因脏工作树报错）', async () => {
+    delete process.env.GITHUB_TOKEN;
+    process.env.CODING_REPO_ROOT = makeDirtyRepo();
+    process.env.GITHUB_OWNER = 'wintim1143';
+    process.env.GITHUB_REPO = 'pr-agent-e2e';
+
+    const res = await githubPushAndOpenPR({ branch: 'feat/1-x', title: 'x', body: 'y' });
+    expect(res.skipped).toBe(true);
+    expect(res.error).toBeUndefined();
   });
 });
