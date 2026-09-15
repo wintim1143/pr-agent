@@ -35,34 +35,53 @@ const coding = createSkill({
 编码质量优先,考虑边界情况与错误处理。`,
 });
 
+/**
+ * ⚠️ skill 只描述「能力与判据」,**不规定输出形状**(2026-09-15 修正)。
+ *
+ * 原实现让 skill 声明最终格式(如 commit-message 写「输出 `<type>(<scope>): <subject>`」),
+ * 而 workflow 的闸门用 zod 校验 `{message}`,两边对不上 → 闸门 3 次重试全挂。
+ * 现在统一约定:**输出形状由调用方(闸门)在 prompt 的「输出契约」段指定**,
+ * skill 只负责「怎么做这件事」;下面每个 instructions 结尾都保留一句此约定。
+ *
+ * 同时清掉三处**不可执行的幻觉指令**(项目里根本没有对应工具):
+ * - code-testing 原写「跑相关单元测试」→ 纯文档改动无测试可跑,模型会陷入两难;
+ * - code-review 原写「跑 lint」→ 项目 `npm run lint` 指向 `mwts check`,本环境冷启动卡死;
+ * - commit-message 原写「必须过 commitlint」→ 无依赖、无配置、无 husky hook。
+ * 这类指令的后果不是"多做一点",而是诱导模型**声称做过实际没做的事**。
+ */
 const codeTesting = createSkill({
   name: 'code-testing',
-  description: '编码完成后强制调用:对改动 diff 运行测试,输出通过/失败 + 报告。不通过不可进入审核。',
-  instructions: `你是测试闸门。对当前改动运行测试:
-1. 跑相关单元测试/集成测试
-2. 检查改动是否破坏既有功能
-3. 输出:通过/失败 + 测试报告 + 失败时的定位建议
-测试不通过必须明确标红,不可放行。`,
+  description: '编码完成后强制调用:对改动 diff 评估测试情况,输出通过/失败 + 报告。不通过不可进入审核。',
+  instructions: `你是测试闸门。对**调用方给出的改动 diff**评估测试情况:
+1. 若仓库存在与改动相关的可执行测试,以其真实结果为准
+2. 若为纯文档/配置类改动(无可执行测试),则判断改动是否满足需求、是否引入破坏性变更
+3. 输出:通过/失败 + 判断依据 + 失败时的定位建议
+测试不通过必须明确标红,不可放行。禁止声称跑过实际未执行的测试。
+输出形状以调用方指定的结构化契约(JSON 字段)为准。`,
 });
 
 const codeReview = createSkill({
   name: 'code-review',
   description: '测试通过后强制调用:审核代码改动的正确性、风格、隐患,输出 approve 或 request changes + 意见。',
-  instructions: `你是代码审核员。审核代码改动:
+  instructions: `你是代码审核员。审核**调用方给出的改动 diff**:
 1. 检查正确性与边界情况
 2. 核对仓库风格与约定
 3. 排查 bug / 安全隐患 / 性能问题
-输出:approve(可进入 commit)或 request changes(附具体意见,打回 coding 重做)。`,
+输出:approve(可进入 commit)或 request changes(附具体意见,打回 coding 重做)。
+仅对 diff 中**真实出现**的改动给出结论;未执行的静态检查(lint 等)不得声称做过。
+输出形状以调用方指定的结构化契约(JSON 字段)为准。`,
 });
 
 const commitMessage = createSkill({
   name: 'commit-message',
   description: '审核通过后强制调用:根据改动 diff + issue 号生成 Conventional Commits 格式的 commit message。',
-  instructions: `你是 commit message 生成器。输入改动 diff + issue 号,生成 Conventional Commits 格式:
+  instructions: `你是 commit message 生成器。根据**调用方给出的改动 diff** + issue 号,生成 Conventional Commits 提交信息:
 <type>(<scope>): <subject>
 [body]
 Closes #<issue-number>
-type ∈ {feat,fix,refactor,test,docs,chore,perf};subject 祈使句 ≤50 字符;必须过 commitlint。`,
+type ∈ {feat,fix,refactor,test,docs,chore,perf};subject 祈使句 ≤50 字符。
+提交信息不得为空。
+输出形状以调用方指定的结构化契约(JSON 字段)为准(通常是单个 message 字符串)。`,
 });
 
 const mergePr = createSkill({

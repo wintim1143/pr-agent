@@ -2,7 +2,27 @@ import { z } from 'zod';
 import { Workflow, createStep } from '@mastra/core/workflows';
 import type { Mastra } from '@mastra/core';
 import { getFeishuConfig, feishuNotify, buildDevCompleteCard } from '../adapters/feishu';
-import { getGithubConfig, githubCheckout, githubPushAndOpenPR, githubMergePR, gitCommit } from '../adapters/github';
+import {
+  getGithubConfig,
+  githubCheckout,
+  githubPushAndOpenPR,
+  githubMergePR,
+  gitCommit,
+  gitDiffForCommit,
+} from '../adapters/github';
+import { stage, stageStart } from '../progress';
+
+/**
+ * 流水线阶段事件埋点(2026-09-14 新增,解决「长等待期无法感知 agent 是否在跑」)。
+ *
+ * 每个 step 进入/结束/失败都写一条结构化事件到 `logs/dev-workflow.log`(JSON Lines),
+ * 同时打到 stdout。此前 coding 步静默等待 5~15 分钟,期间零输出,无法区分
+ * 「LLM 正在思考」/「上游挂死」/「子进程已崩」,只能靠 Claude Code 的会话 jsonl
+ * 事后考古。埋点后可用 `tail -f logs/dev-workflow.log` 实时观察进度。
+ *
+ * 事件类型:`step:start` / `step:done` / `step:fail` / `llm:start` / `llm:done` / `llm:retry`
+ * 详见 `src/mastra/progress.ts`。
+ */
 
 /**
  * 自动开发 workflow 骨架(对应文档 §六)。
@@ -24,12 +44,20 @@ import { getGithubConfig, githubCheckout, githubPushAndOpenPR, githubMergePR, gi
  * 注意:1.63.2 用 `createStep({...})` 工厂(不是 `new Step(...)`);`Step` 仅为类型。
  */
 /**
- * 结构化闸门输出契约(文档 P3-1,2026-09-02 定稿)。
+ * 结构化闸门输出契约(文档 P3-1,2026-09-02 定稿;2026-09-15 修契约缺失)。
  * - test: 测试闸门,passed 决定是否进入 review
  * - review: 审核闸门,decision 决定通过(approve)或打回(request-changes)
- * - commit: commit 闸门,lintPassed 决定是否能进 commit
- * 三个闸门的输出从 `agent.generate` 的 `structuredOutput` 读取(`result.object`),
- * 保证 workflow 条件边(branch/dowhile)能依据结构化字段判定,而非解析字符串。
+ * - commit: commit 闸门,message 是最终落盘的提交文案
+ *
+ * ## ⚠️ schema 只是「事后拦截」,契约必须写进 prompt(2026-09-15 教训)
+ *
+ * 三者原先只在 prompt 里给了**自然语言**说明(test/review 勉强写了个字段列表,commit 一个都没写),
+ * 于是模型转而遵循 `dev-agent.ts` 里 skill 声明的**输出形状** —— 而 zod 按自己的字段校验,
+ * 两边对不上时闸门恒失败。实测证据(run 2026-09-14):commit 步 3 次重试 byte 级相同,
+ * 模型返回 `{type, scope, subject, body}`(commit-message skill 的格式),缺 schema 要的 `message`。
+ *
+ * 所以本文件的约定是:**每个 schema 的字段必须逐字出现在对应 prompt 的「输出契约」段里**,
+ * 并附一个示例。改 schema 必须同步改 prompt —— 只改一边等于把闸门调成恒失败。
  */
 const TestGateSchema = z.object({
   passed: z.boolean(),
@@ -39,9 +67,30 @@ const ReviewGateSchema = z.object({
   decision: z.enum(['approve', 'request-changes']),
   comments: z.array(z.string()),
 });
+/**
+ * commit 闸门输出契约。
+ *
+ * ⚠️ **`message` 必须非空**(2026-09-14 加 `.min(1)`)。
+ * 端到端实测(run 2026-09-14 09:52)模型返回了 `{"message":"","lintPassed":true}` ——
+ * zod 里空串是合法 string,校验通过,于是 `git commit -m ""` 报
+ * `Aborting commit due to empty commit message`,AC-8 失败但**闸门本身判为通过**。
+ * 这是典型的 fail-open:闸门存在的意义是拦住无效产物,空 message 显然是无效产物。
+ * 约束收在 schema 层,让 runGate 的重试机制自动兜底(而非等 git 报错)。
+ *
+ * ## 为什么移除了 `lintPassed`(2026-09-15)
+ *
+ * 原 schema 有 `lintPassed: z.boolean()`,语义是「commitlint 过了吗」。但:
+ * 1. 本项目**没有 commitlint** —— 无依赖、无配置、无 husky hook(已核对 package.json);
+ * 2. `npm run lint` 指向 `mwts check`,在本环境冷启动卡死,跑不出 exit code;
+ * 3. 于是这个字段**只能由 LLM 猜**,且猜错也无人能证伪 —— 一个恒真/随机的字段,
+ *    只会给闸门「这里做过校验」的假象。
+ *
+ * 依「凡能由程序判定的事实,绝不委托 LLM」的原则,这里**删掉**它。
+ * 将来若真要做 lint 闸门,正确形态是 workflow 程序化跑一条真实命令、把 exit code
+ * 填进一个**由程序写入**的字段,而不是加回到这个 schema 里让模型回答。
+ */
 const CommitGateSchema = z.object({
-  message: z.string(),
-  lintPassed: z.boolean(),
+  message: z.string().min(1, 'commit message 不能为空'),
 });
 
 const ContextSchema = z.object({
@@ -88,9 +137,11 @@ async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: stri
   // 以及偶发不守 JSON 格式。这类瞬时故障重试即可恢复,不该直接炸掉整条流水线。
   // 重试仍失败则抛错(fail-closed)——闸门宁可不通过,不能假通过。
   const maxAttempts = Number(process.env.GATE_MAX_ATTEMPTS ?? 3);
+  const t0 = Date.now();
   let lastErr: Error | undefined;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      stage('llm:start', { stage: 'gate', attempt, maxAttempts });
       const res = await agent.generate(prompt);
       const obj = extractJson(res.text);
       const parsed = schema.safeParse(obj);
@@ -100,10 +151,12 @@ async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: stri
             ` | 模型原文(前 200 字): ${String(res.text).slice(0, 200)}`,
         );
       }
+      stage('llm:done', { stage: 'gate', attempt, durationMs: Date.now() - t0 });
       return parsed.data as z.infer<S>;
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
       console.warn(`[runGate] 第 ${attempt}/${maxAttempts} 次闸门调用失败: ${lastErr.message}`);
+      stage('llm:retry', { stage: 'gate', attempt, maxAttempts, error: lastErr.message.slice(0, 200) });
       if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
@@ -127,6 +180,34 @@ function extractJson(text: string | undefined | null): unknown {
     throw new Error(`GATE_JSON_PARSE_FAILED: JSON 解析失败(${msg}),原文(前 200 字): ${text.slice(0, 200)}`);
   }
 }
+/**
+ * 构造闸门输入里的「改动上下文」段 —— 把**真实 diff** 喂给质量闸门(2026-09-15)。
+ *
+ * ## 为什么必须喂(原实现的致命缺陷)
+ *
+ * 修之前,test / review 两个闸门的 prompt **只插了 `issueTitle`**,从头到尾没传过 diff
+ * 或 codingResult。也就是说模型被要求「对当前改动运行测试」「审核当前改动」,
+ * 却**看不见任何改动**。它返回 `passed=false` / `request-changes` 不是乱判 ——
+ * 是正确地拒绝为看不见的东西背书(fail-closed)。闸门因此恒判负,等于废掉。
+ *
+ * 讽刺的是 commit 闸门反而传了 diff(2026-09-14 补),只是没传契约 —— **两条闸门各缺一半**。
+ * 本次把 diff 输入统一补齐,commit 那边的契约也一并钉死。
+ *
+ * ## 为什么复用 `gitDiffForCommit` 而不是各写一份
+ *
+ * 它取的是「工作树 ∪ 已提交」的并集(coding 的改动此刻还在工作树里未提交),
+ * 与 `verify-local-write.js` 的 AC-2 判据同源,保证「闸门看到的」与「验收看到的」一致。
+ *
+ * @param maxChars 截断上限;不传则由 `gitDiffForCommit` 读 `COMMIT_DIFF_MAX_CHARS`(默认 8000)
+ */
+function buildChangeContext(maxChars?: number): { text: string; diffChars: number; truncated: boolean } {
+  const { stat, diff, truncated } = gitDiffForCommit('main', maxChars);
+  const text =
+    `【改动统计】\n${stat || '(无 diff stat)'}\n\n` +
+    `【改动内容 diff】\n${diff || '(无 diff 内容 —— 工作树与目标分支均无差异)'}`;
+  return { text, diffChars: diff.length, truncated };
+}
+
 /** 生成 PR 描述(供 push-open-pr 步使用) */
 function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
   const lines = [
@@ -153,8 +234,10 @@ const checkout = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
+    const p = stageStart('checkout');
     try {
       const branch = await githubCheckout(inputData.issueNumber, inputData.issueTitle);
+      p.done({ branch });
       return { ...inputData, branch };
     } catch (e) {
       // 2026-09-07 改:原实现失败后返回占位分支名 `feat/<n>-dev` 并仅 warn,**不阻断**。
@@ -163,6 +246,7 @@ const checkout = createStep({
       // 建分支失败没有安全的降级路径,必须显式失败。
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[checkout] 建分支失败,终止流程(不降级到占位分支名): ${msg}`);
+      p.fail(e);
       throw e;
     }
   },
@@ -195,6 +279,7 @@ const coding = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData }) => {
+    const p = stageStart('coding');
     // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
     const { getCodingAgent, missingCodingCredentials, getRepoRoot } = await import('../agents/coding-agent.js');
     if (missingCodingCredentials()) {
@@ -210,26 +295,49 @@ const coding = createStep({
       // 2026-09-07 改:原先返回占位串继续跑,于是 test/review/commit 基于「什么都没改」的空仓库
       // 全部跑完,末尾还可能提交一个空 commit —— 表面走完全流程,实质零产出且难判别。
       // 编码是后续一切闸门的输入,它没跑就等于这次运行没有意义,应当终止。
+      p.fail('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据');
       throw new Error('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据,编码未执行');
     }
     try {
       const agent = await getCodingAgent(getRepoRoot());
       const timeoutMs = Number(process.env.CODING_TIMEOUT_MS ?? 600_000);
-      const res = await withCodingGuard(
-        agent.generate([
-        {
-          role: 'user',
-          content:
-          `你在一个 git 仓库的 feature 分支 \`${inputData.branch}\` 上。请实现以下 issue 对应的代码改动:\n\n` +
-            `**标题**: ${inputData.issueTitle}\n` +
-            (inputData.issueBody ? `**描述**:\n${inputData.issueBody}\n` : '') +
-            '\n要求:\n- 直接修改仓库中的文件(不要只输出代码片段)\n' +
-            '- 保持代码风格一致\n- 完成后简要说明你改了哪些文件、为什么\n' +
-            '- 不要 git commit(后续 commit 步会提交)',
-        },
-        ]),
-        timeoutMs
-      );
+      const prompt =
+        `你在一个 git 仓库的 feature 分支 \`${inputData.branch}\` 上。请实现以下 issue 对应的代码改动:\n\n` +
+        `**标题**: ${inputData.issueTitle}\n` +
+        (inputData.issueBody ? `**描述**:\n${inputData.issueBody}\n` : '') +
+        '\n要求:\n- 直接修改仓库中的文件(不要只输出代码片段)\n' +
+        '- 保持代码风格一致\n- 完成后简要说明你改了哪些文件、为什么\n' +
+        '- 不要 git commit(后续 commit 步会提交)';
+
+      // 关键观测点(2026-09-14):编码是唯一「分钟级静默阻塞」的步骤。此处显式打出
+      // 「即将调用、超时预算多少」,让使用者知道**等待是预期的**而非挂死。
+      stage('llm:start', { stage: 'coding', timeoutMs, repoRoot: getRepoRoot(), branch: inputData.branch });
+
+      // 心跳(2026-09-14):每 HEARTBEAT_MS 打一条,证明进程活着。Claude Code CLI 内部
+      // 无法逐轮回调(见下方 stream 方案评估),心跳是当前唯一能区分「慢」与「死」的手段。
+      // 默认 30s,设 PR_AGENT_HEARTBEAT_MS=0 可关闭。
+      const heartbeatMs = Number(process.env.PR_AGENT_HEARTBEAT_MS ?? 30_000);
+      const t0 = Date.now();
+      const heartbeat = heartbeatMs > 0
+        ? setInterval(() => {
+            stage('llm:done', {
+              stage: 'coding',
+              heartbeat: true,
+              elapsedMs: Date.now() - t0,
+              note: '编码子进程仍在运行(此为心跳,非完成)',
+            });
+          }, heartbeatMs)
+        : undefined;
+
+      let res;
+      try {
+        res = await withCodingGuard(agent.generate([{ role: 'user', content: prompt }]), timeoutMs);
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
+      }
+
+      stage('llm:done', { stage: 'coding', durationMs: Date.now() - t0, resultLen: String(res.text ?? '').length });
+      p.done({ durationMs: Date.now() - t0 });
       return { ...inputData, codingResult: res.text ?? '(no output)' };
     } catch (e) {
       // 2026-09-07 改:同上 —— 编码失败后 test/review/commit 失去意义,不降级、不占位,直接终止。
@@ -237,6 +345,7 @@ const coding = createStep({
       // LLM 并因 502 失败,整个 run 变成「两次超时的叠加」,错误信息反而更难读。
       const msg = e instanceof Error ? e.message : String(e);
       console.error('[coding] ClaudeSDKAgent 执行异常,终止流程:', msg);
+      p.fail(e);
       throw e;
     }
   },
@@ -249,13 +358,33 @@ const testStep = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const testResult = await runGate(
-      mastra,
-      `使用 code-testing skill 对当前改动运行测试,输出结构化结果 { passed: boolean, report: string }。需求:${inputData.issueTitle}`,
-      TestGateSchema
-    );
-    // TODO: passed=false 时回到 coding 重做(条件边 branch/dowhile,见文档 §十二)
-    return { ...inputData, testResult };
+    const p = stageStart('test');
+    try {
+      // 2026-09-15 修:原先 prompt 只给 issueTitle,模型看不见改动 → 恒判 false(盲评)。
+      // 现在把真实 diff + coding 自述一起喂进去,判定才有依据。
+      const change = buildChangeContext();
+      stage('llm:start', { stage: 'test', diffChars: change.diffChars, truncated: change.truncated });
+      const testResult = await runGate(
+        mastra,
+        `使用 code-testing skill 对**下列改动**运行/评估测试。\n\n` +
+          `【需求】${inputData.issueTitle}\n\n` +
+          `【编码者自述】\n${(inputData.codingResult ?? '(无)').slice(0, 1500)}\n\n` +
+          `${change.text}\n\n` +
+          `【输出契约(强制)】只输出一个 JSON 对象,字段如下(不得增删):\n` +
+          `{\n  "passed": boolean,   // 改动是否可安全进入审核\n  "report": string      // 你根据上面 diff 得出的结论与依据\n}\n` +
+          `示例:{"passed":true,"report":"新增 README 安装小节,两条命令与需求一致;纯文档改动无测试可跑。"}\n\n` +
+          `【判定依据】passed 必须基于**上面看到的真实改动**。若仓库存在可执行测试,以其结果为准;` +
+          `若为纯文档/配置类改动(无可执行测试),则判断改动本身是否满足需求、是否引入破坏性变更。` +
+          `改动为空或明显不完整时判 false,并在 report 里说明缺什么。**不要为看不见的内容背书。**`,
+        TestGateSchema
+      );
+      // TODO: passed=false 时回到 coding 重做(条件边 branch/dowhile,见文档 §十二)
+      p.done({ passed: testResult.passed });
+      return { ...inputData, testResult };
+    } catch (e) {
+      p.fail(e);
+      throw e;
+    }
   },
 });
 
@@ -266,13 +395,32 @@ const review = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const reviewResult = await runGate(
-      mastra,
-      `使用 code-review skill 审核当前改动,输出结构化结果 { decision: 'approve' | 'request-changes', comments: string[] }。需求:${inputData.issueTitle}`,
-      ReviewGateSchema
-    );
-    // TODO: decision=request-changes 时回到 coding(条件边,见文档 §十二)
-    return { ...inputData, reviewResult };
+    const p = stageStart('review');
+    try {
+      // 2026-09-15 修:同 test 步 —— 原先只给 issueTitle,review 看不见改动 → 恒判 request-changes。
+      const change = buildChangeContext();
+      stage('llm:start', { stage: 'review', diffChars: change.diffChars, truncated: change.truncated });
+      const reviewResult = await runGate(
+        mastra,
+        `使用 code-review skill 审核**下列改动**。\n\n` +
+          `【需求】${inputData.issueTitle}\n\n` +
+          `【编码者自述】\n${(inputData.codingResult ?? '(无)').slice(0, 1500)}\n\n` +
+          `${change.text}\n\n` +
+          `【输出契约(强制)】只输出一个 JSON 对象,字段如下(不得增删):\n` +
+          `{\n  "decision": "approve" | "request-changes",  // 只能是这两个字面量之一\n  "comments": string[]                         // 逐条具体意见;approve 时可为空数组\n}\n` +
+          `示例:{"decision":"approve","comments":[]}\n\n` +
+          `【判定依据】decision 必须基于**上面看到的真实改动**:仅当改动满足需求且无明显缺陷时 approve;` +
+          `否则 request-changes,并在 comments 里逐条指出具体问题(定位到文件/行为,不要泛泛而谈)。` +
+          `**不要为看不见的内容背书。**`,
+        ReviewGateSchema
+      );
+      // TODO: decision=request-changes 时回到 coding(条件边,见文档 §十二)
+      p.done({ decision: reviewResult.decision });
+      return { ...inputData, reviewResult };
+    } catch (e) {
+      p.fail(e);
+      throw e;
+    }
   },
 });
 
@@ -283,21 +431,42 @@ const commit = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData }) => {
-    const commitResult = await runGate(
-      mastra,
-      `使用 commit-message skill 为改动生成 commit message,关联 issue #${inputData.issueNumber},输出结构化结果 { message: string, lintPassed: boolean }。`,
-      CommitGateSchema
-    );
-    // 真正落盘:把当前改动 commit 到 feature 分支(git add -A + commit)
+    const p = stageStart('commit');
     try {
-      const r = gitCommit(commitResult.message);
-      if (!r.committed && r.error && r.error !== 'nothing-to-commit') {
-        console.warn('[commit] 未产生提交:', r.error);
+      // 2026-09-15 修:改用公共 helper(不再各写一份 diff 取法),并把「输出契约」逐字写进 prompt。
+      // 原实现只写「使用 commit-message skill 生成 commit message」——模型于是按 skill 声明的
+      // {type, scope, subject, body} 输出,而 schema 要 {message}:两边对不上,3 次重试全挂。
+      const change = buildChangeContext();
+      stage('llm:start', { stage: 'commit', diffChars: change.diffChars, truncated: change.truncated });
+
+      const commitResult = await runGate(
+        mastra,
+        `使用 commit-message skill 为**下列改动**生成 commit message,关联 issue #${inputData.issueNumber}。\n\n` +
+          `【需求】${inputData.issueTitle}\n\n` +
+          `${change.text}\n\n` +
+          `【输出契约(强制)】只输出一个 JSON 对象,字段如下(不得增删):\n` +
+          `{\n  "message": string   // 完整的 Conventional Commits 提交信息。首行形如 "docs(readme): add install section",可附 body 段;不得为空\n}\n` +
+          `示例:{"message":"docs(readme): add install section\\n\\nAdd git clone and npm install steps.\\n\\nCloses #1"}\n\n` +
+          `注意:message 用 \\n 表示换行。不要输出 type / scope / subject / body 这类拆分字段,` +
+          `也不要输出 command 字段 —— 只要上面这一个 message 字符串。`,
+        CommitGateSchema
+      );
+      // 真正落盘:把当前改动 commit 到 feature 分支(git add -A + commit)
+      try {
+        const r = gitCommit(commitResult.message);
+        if (!r.committed && r.error && r.error !== 'nothing-to-commit') {
+          console.warn('[commit] 未产生提交:', r.error);
+        }
+        p.done({ committed: r.committed, message: commitResult.message.slice(0, 60) });
+      } catch (e) {
+        console.warn('[commit] git commit 异常:', e instanceof Error ? e.message : e);
+        p.done({ committed: false, gitError: e instanceof Error ? e.message : String(e) });
       }
+      return { ...inputData, commitResult };
     } catch (e) {
-      console.warn('[commit] git commit 异常:', e instanceof Error ? e.message : e);
+      p.fail(e);
+      throw e;
     }
-    return { ...inputData, commitResult };
   },
 });
 
@@ -317,20 +486,31 @@ const pushOpenPr = createStep({
       // 未配置 GitHub → 跳过,prNumber 保持 0,不阻断后续 notify/merge
       return { ...inputData, prNumber: 0 };
     }
-    const res = await githubPushAndOpenPR({
-      branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
-      title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
-      body: buildPrBody(inputData),
-      commitMessage: inputData.commitResult?.message,
-    });
-    if (res.error) {
-      console.warn('[push-open-pr] 开 PR 失败:', res.error);
-    } else if (res.skipped) {
-      console.warn('[push-open-pr] 未配置 GitHub,已跳过');
-    } else if (res.prUrl) {
-      console.log('[push-open-pr] PR 已开:', res.prUrl);
+    const p = stageStart('push-open-pr');
+    try {
+      const res = await githubPushAndOpenPR({
+        branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
+        title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
+        body: buildPrBody(inputData),
+        commitMessage: inputData.commitResult?.message,
+      });
+      if (res.error) {
+        console.warn('[push-open-pr] 开 PR 失败:', res.error);
+        p.fail(res.error);
+      } else if (res.skipped) {
+        console.warn('[push-open-pr] 未配置 GitHub,已跳过');
+        p.done({ skipped: true });
+      } else if (res.prUrl) {
+        console.log('[push-open-pr] PR 已开:', res.prUrl);
+        p.done({ prNumber: res.prNumber, prUrl: res.prUrl });
+      } else {
+        p.done({});
+      }
+      return { ...inputData, prNumber: res.prNumber };
+    } catch (e) {
+      p.fail(e);
+      throw e;
     }
-    return { ...inputData, prNumber: res.prNumber };
   },
 });
 
@@ -352,6 +532,7 @@ const notify = createStep({
     if (!getFeishuConfig()) {
       return inputData;
     }
+    const p = stageStart('notify');
     try {
       const res = await feishuNotify(
         buildDevCompleteCard({
@@ -363,9 +544,13 @@ const notify = createStep({
       );
       if (!res.ok) {
         console.warn(`[notify] 飞书推送失败(mode=${res.mode}):`, res.error || JSON.stringify(res.raw));
+        p.fail(`飞书推送失败(mode=${res.mode})`);
+      } else {
+        p.done({ mode: res.mode });
       }
     } catch (e) {
       console.warn('[notify] 飞书推送异常:', e instanceof Error ? e.message : e);
+      p.fail(e);
     }
     return inputData;
   },
@@ -385,15 +570,18 @@ const merge = createStep({
     }
     // 未收到用户确认 → 挂起,等飞书卡片点"合并"后 resume({ approved: true })
     if (!resumeData || !(resumeData as { approved?: boolean }).approved) {
+      stage('step:start', { stage: 'merge', waitingFor: 'merge-approval' });
       return suspend({
         waitingFor: 'merge-approval',
         issueNumber: inputData.issueNumber,
       });
     }
+    const p = stageStart('merge', 'resumed');
     // 已确认:真实合并。没开出 PR(prNumber=0)就没东西可合,标记失败供上层判读。
     if (!inputData.prNumber || inputData.prNumber <= 0) {
       const mergeResult = `merge-skipped: 无已开 PR(prNumber=${inputData.prNumber ?? 0}),无法合并`;
       console.warn(`[merge] ${mergeResult}`);
+      p.done({ merged: false, reason: 'no-pr' });
       return { ...inputData, mergeResult };
     }
     try {
@@ -401,13 +589,19 @@ const merge = createStep({
       const mergeResult = res.merged
         ? `merge-ok: PR #${inputData.prNumber} 已 squash 合入(sha=${res.sha})`
         : `merge-fail: ${res.message ?? '未知原因'}`;
-      if (!res.merged) console.warn(`[merge] ${mergeResult}`);
-      else console.log(`[merge] ${mergeResult}`);
+      if (!res.merged) {
+        console.warn(`[merge] ${mergeResult}`);
+        p.fail(mergeResult);
+      } else {
+        console.log(`[merge] ${mergeResult}`);
+        p.done({ merged: true, sha: res.sha });
+      }
       return { ...inputData, mergeResult };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const mergeResult = `merge-error: ${msg}`;
       console.error(`[merge] ${mergeResult}`);
+      p.fail(e);
       return { ...inputData, mergeResult };
     }
   },

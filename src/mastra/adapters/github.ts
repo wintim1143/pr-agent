@@ -298,6 +298,51 @@ function countAhead(root: string, base: string, branch: string): number {
 }
 
 /**
+ * 取当前工作树相对 base 分支的改动 diff(含未提交改动),供 commit-message 闸门使用。
+ *
+ * ## 为什么需要(2026-09-14)
+ *
+ * `commit-message/SKILL.md` 明写「输入改动 diff + issue 号」,但 dev-workflow 的
+ * commit 步**从来只传了 issue 号、没传 diff** —— 闸门拿不到改动内容,只能靠猜,
+ * 于是产出 `chore(#1): no changes provided...` 这类劣质文案(M2 §M2-6 质量观察 #1)。
+ * 切到 DeepSeek 后更严重:模型直接返回空 message,`git commit -m ""` 报
+ * `Aborting commit due to empty commit message`。
+ *
+ * ## 为什么要「工作树 ∪ 已提交」两段
+ *
+ * commit 步运行在 coding 之后、commit 之前,此时 coding 的改动**还在工作树里未提交**;
+ * 但若上游步骤(或重跑)已经提交过,则要取已提交差异。两者取并集,与
+ * `verify-local-write.js` 的 AC-2 判据保持一致。
+ *
+ * @param base 对比基准分支(默认 main)
+ * @param maxChars 截断上限,防止超大 diff 撑爆 prompt(默认 8000)
+ */
+export function gitDiffForCommit(
+  base = 'main',
+  maxChars = Number(process.env.COMMIT_DIFF_MAX_CHARS ?? 8000),
+  root: string = repoRoot()
+): { stat: string; diff: string; truncated: boolean } {
+  const run = (args: string[]): string => {
+    try {
+      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    } catch {
+      return '';
+    }
+  };
+  // 已提交差异(工作树 HEAD vs base)
+  const committed = run(['diff', `${base}...HEAD`]);
+  // 未提交改动(工作树 vs HEAD),含新增文件
+  const uncommitted = run(['diff', 'HEAD']);
+  const untracked = run(['ls-files', '--others', '--exclude-standard']);
+  const diff = [committed, uncommitted].filter(Boolean).join('\n');
+  const stat = run(['diff', '--stat', `${base}...HEAD`]) || run(['diff', '--stat', 'HEAD']);
+
+  const full = untracked ? `${diff}\n\n[未跟踪的新文件]\n${untracked}` : diff;
+  const truncated = full.length > maxChars;
+  return { stat, diff: truncated ? full.slice(0, maxChars) + `\n...(diff 已截断,原始长度 ${full.length} 字符)` : full, truncated };
+}
+
+/**
  * 真正执行一次 git 提交(供 commit 步与 push-open-pr 兜底使用)。
  * - 先 `git add -A`(仅暂跟踪内文件;`.env` 等 gitignore 项不会被加入)
  * - 若没有任何改动可提交,返回 { committed:false, error:'nothing-to-commit' }
