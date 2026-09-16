@@ -16,7 +16,14 @@
  */
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve } from 'node:path';
+import {
+  resolveRepoEntry,
+  repoKeyOf,
+  assertLogicalTarget,
+  type RepoEntry,
+  type RepoTarget,
+} from './repo-registry.js';
 
 /** 统一 REST 调用:失败(<2xx)抛 `GithubApiError`(含 status + 响应体),供调用方判读。 */
 export async function githubRequest<T>(
@@ -50,6 +57,78 @@ export interface GithubConfig {
 }
 
 /**
+ * 校验一个目录确实是 git 工作树的根，否则显式抛错。
+ *
+ * ⚠️ 刻意**不提供**「目录不存在就回退到 cwd」的降级 —— 那等于在错误的仓库上动手且不报错
+ * （M2 已确立此行为，M5 沿用）。
+ */
+function assertRepoDir(dir: string, who: string): string {
+  if (!existsSync(dir)) {
+    throw new Error(`${who} 指向的目录不存在: ${dir}`);
+  }
+  if (!existsSync(join(dir, '.git'))) {
+    throw new Error(`${who} 指向的不是 git 仓库(缺 .git): ${dir}`);
+  }
+  return dir;
+}
+
+/** 路径等价判定（Windows 大小写不敏感、忽略尾部分隔符）。 */
+function samePath(a: string, b: string): boolean {
+  const na = resolve(a).replace(/[\\/]+$/, '');
+  const nb = resolve(b).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? na.toLowerCase() === nb.toLowerCase() : na === nb;
+}
+
+/**
+ * 旧「单仓库」配置在当前进程里指的是哪个仓库（用于冲突检测）。
+ *
+ * 取值顺序与 `getGithubConfig()` 一致：显式 `GITHUB_OWNER`/`GITHUB_REPO` 优先，
+ * 否则从 `CODING_REPO_ROOT` 的 origin remote 反推。取不到返回 null（= 未配置单仓库模式）。
+ */
+function resolveEnvRepoKey(): string | null {
+  const owner = process.env.GITHUB_OWNER?.trim();
+  const repo = process.env.GITHUB_REPO?.trim();
+  if (owner && repo) return `${owner}/${repo}`;
+  const legacyRoot = process.env.CODING_REPO_ROOT?.trim();
+  if (legacyRoot) {
+    const p = parseOwnerRepo(legacyRoot);
+    return p ? repoKeyOf(p) : null;
+  }
+  return null;
+}
+
+/**
+ * 检测「旧 env」与「仓库注册表」对**同一个仓库**给出的配置是否矛盾（M5 卡 §10）。
+ *
+ * ⚠️ 只在两者说的**是同一个 repoKey** 时比对 —— 否则多仓库模式下必然误报：
+ * `.env` 里那套单仓库配置说的永远是靶场 A，跑 target B 时与本 target 无关。
+ *
+ * 矛盾时**显式报错**而不是「target 优先」：静默取其一正是 M3「base 改名导致红线失效」
+ * 那类问题的成因（两处配置各说各话，谁生效取决于读的顺序）。
+ */
+function assertNoEnvConflict(target: RepoTarget, entry: RepoEntry): void {
+  if (resolveEnvRepoKey() !== repoKeyOf(target)) return;
+
+  const legacyRoot = process.env.CODING_REPO_ROOT?.trim();
+  if (legacyRoot && !samePath(legacyRoot, entry.localPath)) {
+    throw new Error(
+      `仓库配置矛盾：target ${repoKeyOf(target)} 的注册表 localPath 是 ${entry.localPath}，` +
+        `而 CODING_REPO_ROOT 指向 ${legacyRoot}。两者说的是同一个仓库，必须一致（此处刻意不静默取其一）。`
+    );
+  }
+  const envBases = (process.env.GITHUB_BASE_BRANCH ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (envBases.length > 0 && !envBases.includes(target.baseBranch)) {
+    throw new Error(
+      `仓库配置矛盾：target ${repoKeyOf(target)} 的 baseBranch 是 ${target.baseBranch}，` +
+        `而 GITHUB_BASE_BRANCH 是 ${envBases.join(',')}。两者说的是同一个仓库，必须一致。`
+    );
+  }
+}
+
+/**
  * 仓库根目录(git 工作树顶层)。
  *
  * ## 为什么需要 `CODING_REPO_ROOT`(2026-09-07)
@@ -62,18 +141,24 @@ export interface GithubConfig {
  *
  * 与 `agents/coding-agent.ts` 的 `getRepoRoot()` 读同一个 env,
  * 保证 checkout / coding / commit 落在同一个仓库。
+ *
+ * ## M5 扩展:可选 `target`（多仓库）
+ *
+ * 传了 `target` 就**完全走仓库注册表**（本机路径由注册表解析），并顺带做一次
+ * 「旧 env 与注册表是否矛盾」的显式检测（`assertNoEnvConflict`）。
+ * **不传 target 时行为与 M4 逐字一致** —— 这是 M5「增量推进而非大爆炸」的关键：
+ * M1–M4 的验证脚本与单仓库模式零改动继续可用。
+ *
+ * @param target 逻辑仓库标识（owner/repo/baseBranch）。省略 → 沿用 `CODING_REPO_ROOT` 单仓库模式。
  */
-function repoRoot(): string {
-  const configured = process.env.CODING_REPO_ROOT?.trim();
-  if (configured) {
-    if (!existsSync(configured)) {
-      throw new Error(`CODING_REPO_ROOT 指向的目录不存在: ${configured}`);
-    }
-    if (!existsSync(join(configured, '.git'))) {
-      throw new Error(`CODING_REPO_ROOT 指向的不是 git 仓库(缺 .git): ${configured}`);
-    }
-    return configured;
+export function repoRoot(target?: RepoTarget): string {
+  if (target) {
+    const entry = resolveRepoEntry(target);
+    assertNoEnvConflict(target, entry);
+    return assertRepoDir(entry.localPath, `${repoKeyOf(target)} 的注册表 localPath`);
   }
+  const configured = process.env.CODING_REPO_ROOT?.trim();
+  if (configured) return assertRepoDir(configured, 'CODING_REPO_ROOT');
   return execFileSync('git', ['rev-parse', '--show-toplevel'], {
     encoding: 'utf8',
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -127,8 +212,15 @@ function slug(title: string): string {
 }
 
 /** 读取 GitHub 配置;缺少 token 或无法解析 owner/repo 时返回 null */
-export function getGithubConfig(): GithubConfig | null {
+export function getGithubConfig(target?: RepoTarget): GithubConfig | null {
   const token = process.env.GITHUB_TOKEN;
+  // M5:显式 target 直接给出 owner/repo/baseBranch —— **不再从 env / git remote 猜**。
+  // 这条是「在错误的仓库上开 PR」的结构性防线:猜的成本不对称（猜错就在别人的仓库动手）。
+  if (target) {
+    assertLogicalTarget(target);
+    if (!token) return null;
+    return { token, owner: target.owner, repo: target.repo, baseBranch: target.baseBranch };
+  }
 
   let owner = process.env.GITHUB_OWNER;
   let repo = process.env.GITHUB_REPO;
@@ -144,11 +236,13 @@ export function getGithubConfig(): GithubConfig | null {
 }
 
 /** 返回缺失的配置项(用于验证脚本提示用户去哪补) */
-export function missingGithubConfig(): string[] {
+export function missingGithubConfig(target?: RepoTarget): string[] {
   const miss: string[] = [];
   if (!process.env.GITHUB_TOKEN) {
     miss.push('GITHUB_TOKEN(fine-grained PAT,需 Contents + Pull requests 写权限)');
   }
+  // 显式 target 时 owner/repo/baseBranch 全部来自 target，不存在「缺哪个 env」的情况
+  if (target) return miss;
   let owner = process.env.GITHUB_OWNER;
   let repo = process.env.GITHUB_REPO;
   if (!owner || !repo) {
@@ -336,28 +430,33 @@ function countAhead(root: string, base: string, branch: string): number {
  * 但若上游步骤(或重跑)已经提交过,则要取已提交差异。两者取并集,与
  * `verify-local-write.js` 的 AC-2 判据保持一致。
  *
- * @param base 对比基准分支(默认 main)
+ * @param base 对比基准分支(默认 main;M5 起可由 `target.baseBranch` 提供)
  * @param maxChars 截断上限,防止超大 diff 撑爆 prompt(默认 8000)
+ * @param root 目标仓库根目录;省略时按 `target` 解析,再省略则回退 `repoRoot()`
+ * @param target M5:逻辑仓库标识,使本函数仓库无关
  */
 export function gitDiffForCommit(
-  base = 'main',
+  base?: string,
   maxChars = Number(process.env.COMMIT_DIFF_MAX_CHARS ?? 8000),
-  root: string = repoRoot()
+  root?: string,
+  target?: RepoTarget
 ): { stat: string; diff: string; truncated: boolean } {
+  const r = root ?? repoRoot(target);
+  const b = base ?? target?.baseBranch ?? 'main';
   const run = (args: string[]): string => {
     try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      return execFileSync('git', args, { cwd: r, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
     } catch {
       return '';
     }
   };
   // 已提交差异(工作树 HEAD vs base)
-  const committed = run(['diff', `${base}...HEAD`]);
+  const committed = run(['diff', `${b}...HEAD`]);
   // 未提交改动(工作树 vs HEAD),含新增文件
   const uncommitted = run(['diff', 'HEAD']);
   const untracked = run(['ls-files', '--others', '--exclude-standard']);
   const diff = [committed, uncommitted].filter(Boolean).join('\n');
-  const stat = run(['diff', '--stat', `${base}...HEAD`]) || run(['diff', '--stat', 'HEAD']);
+  const stat = run(['diff', '--stat', `${b}...HEAD`]) || run(['diff', '--stat', 'HEAD']);
 
   const full = untracked ? `${diff}\n\n[未跟踪的新文件]\n${untracked}` : diff;
   const truncated = full.length > maxChars;
@@ -377,16 +476,18 @@ export function gitDiffForCommit(
  * 若哪天 gitDiffForCommit 改了取法，这里必须同步改 —— 否则会出现
  * 「diff 里有测试文件、检测却说没有」这种静默不一致。
  */
-export function gitChangedFiles(base = 'main', root: string = repoRoot()): string[] {
+export function gitChangedFiles(base?: string, root?: string, target?: RepoTarget): string[] {
+  const r = root ?? repoRoot(target);
+  const b = base ?? target?.baseBranch ?? 'main';
   const run = (args: string[]): string => {
     try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      return execFileSync('git', args, { cwd: r, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
     } catch {
       return '';
     }
   };
   const rows = [
-    run(['diff', '--name-only', `${base}...HEAD`]),
+    run(['diff', '--name-only', `${b}...HEAD`]),
     run(['diff', '--name-only', 'HEAD']),
     run(['ls-files', '--others', '--exclude-standard']),
   ]
@@ -411,12 +512,15 @@ export function gitChangedFiles(base = 'main', root: string = repoRoot()): strin
  * 未跟踪文件一律记为 `A`（在 git 眼里就是新增）。
  */
 export function gitChangedFilesWithStatus(
-  base = 'main',
-  root: string = repoRoot()
+  base?: string,
+  root?: string,
+  target?: RepoTarget
 ): Array<{ path: string; status: string }> {
+  const r = root ?? repoRoot(target);
+  const b = base ?? target?.baseBranch ?? 'main';
   const run = (args: string[]): string => {
     try {
-      return execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      return execFileSync('git', args, { cwd: r, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
     } catch {
       return '';
     }
@@ -430,7 +534,7 @@ export function gitChangedFilesWithStatus(
       out.push({ path: parts[parts.length - 1], status: parts[0][0] });
     }
   };
-  parse(run(['diff', '--name-status', `${base}...HEAD`]));
+  parse(run(['diff', '--name-status', `${b}...HEAD`]));
   parse(run(['diff', '--name-status', 'HEAD']));
   for (const f of run(['ls-files', '--others', '--exclude-standard']).split('\n')) {
     const p = f.trim();
@@ -452,15 +556,17 @@ export function gitChangedFilesWithStatus(
  */
 export function gitCommit(
   message: string,
-  root: string = repoRoot()
+  root?: string,
+  target?: RepoTarget
 ): {
   committed: boolean;
   error?: string;
 } {
+  const r = root ?? repoRoot(target);
   try {
-    execFileSync('git', ['add', '-A'], { cwd: root, stdio: 'pipe' });
+    execFileSync('git', ['add', '-A'], { cwd: r, stdio: 'pipe' });
     const out = execFileSync('git', ['commit', '-m', message], {
-      cwd: root,
+      cwd: r,
       encoding: 'utf8',
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -468,11 +574,11 @@ export function gitCommit(
     const shortSha = parseCommitSha(out);
     if (shortSha) {
       const full = execFileSync('git', ['rev-parse', shortSha], {
-        cwd: root,
+        cwd: r,
         encoding: 'utf8',
         stdio: ['pipe', 'pipe', 'pipe'],
       }).trim();
-      ensureRefFlushed(root, full);
+      ensureRefFlushed(r, full);
     }
     return { committed: true };
   } catch (e) {
@@ -489,10 +595,14 @@ export function gitCommit(
  * checkout 步:基于 issue 创建并切到 feature 分支 `feat/<n>-<slug>`。
  * 不抛错——失败时由调用方降级为占位分支名,后续 push-open-pr 会再次暴露错误。
  */
-export async function githubCheckout(issueNumber: number, issueTitle: string): Promise<string> {
-  const root = repoRoot();
+export async function githubCheckout(
+  issueNumber: number,
+  issueTitle: string,
+  target?: RepoTarget
+): Promise<string> {
+  const root = repoRoot(target);
   const branch = `feat/${issueNumber}-${slug(issueTitle)}`;
-  const base = getGithubConfig()?.baseBranch || 'main';
+  const base = getGithubConfig(target)?.baseBranch || target?.baseBranch || 'main';
   // 红线:绝不允许在 base 分支上直接开发。同名说明 issue 标题 slug 退化成了 base 名。
   if (branch === base) {
     throw new Error(`拒绝 checkout:目标分支 ${branch} 与 base 分支 ${base} 同名(不得在 base 分支上直接开发)`);
@@ -526,12 +636,14 @@ export async function githubPushAndOpenPR(opts: {
   title: string;
   body: string;
   baseBranch?: string;
+  /** M5：多仓库目标。给出后 owner/repo/baseBranch 全部来自它，不再从 env / git remote 猜。 */
+  target?: RepoTarget;
 }): Promise<PushPrResult> {
-  const cfg = getGithubConfig();
+  const cfg = getGithubConfig(opts.target);
   if (!cfg) {
     return { prNumber: 0, prUrl: null, skipped: true };
   }
-  const root = repoRoot();
+  const root = repoRoot(opts.target);
   const branch = opts.branch;
   const base = opts.baseBranch || cfg.baseBranch;
 
@@ -629,13 +741,13 @@ async function openPrForBranch(
  */
 export async function githubMergePR(
   prNumber: number,
-  opts: { baseBranch?: string } = {}
+  opts: { baseBranch?: string; target?: RepoTarget } = {}
 ): Promise<{
   merged: boolean;
   message: string | null;
   sha: string | null;
 }> {
-  const cfg = getGithubConfig();
+  const cfg = getGithubConfig(opts.target);
   if (!cfg) {
     throw new Error('GitHub 未配置:缺少 GITHUB_TOKEN(需 Contents + Pull requests 写权限)');
   }

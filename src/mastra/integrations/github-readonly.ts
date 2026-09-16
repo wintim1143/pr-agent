@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { Integration } from '@mastra/core/integration';
 import { createTool } from '@mastra/core/tools';
 import { getGithubConfig, githubRequest, type GithubConfig } from '../adapters/github';
+import type { RepoTarget } from '../adapters/repo-registry';
 
 /**
  * GitHub 只读集成(M1-2)。
@@ -92,8 +93,8 @@ function makeClient(cfg: GithubConfig): GithubReadonlyClient {
 }
 
 /** 读取 GitHub 只读 client;未配置返回 null(不抛)。 */
-export function getGithubReadonlyClient(): GithubReadonlyClient | null {
-  const cfg = getGithubConfig();
+export function getGithubReadonlyClient(target?: RepoTarget): GithubReadonlyClient | null {
+  const cfg = getGithubConfig(target);
   return cfg ? makeClient(cfg) : null;
 }
 

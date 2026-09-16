@@ -22,6 +22,12 @@ mastra.db
 mastra.db-shm
 mastra.db-wal
 
+# 仓库注册表(M5):把 repoKey 映射到**本机 clone 绝对路径**。
+# 它是「某台机器的事实」而非项目属性 —— 入库会让每个使用者互相覆盖对方的路径。
+# 结构与填写说明见 repos.registry.example.json(那个是入库的);
+# 也可用 REPO_REGISTRY_PATH 指向别处的同结构文件。
+repos.registry.json
+
 # 一次性验证脚本(探针 / 手工验证用),不入库,可留着不删。
 # 与 test/ 的区别见 CONTRIBUTING 约定:test/ 进 CI,.tmp/verify/ 不进。
 # 放在项目内而非 /tmp:需要 require/import 项目依赖(node_modules 解析)。

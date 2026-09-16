@@ -5,6 +5,8 @@ import path from 'node:path';
 import type { ClaudeSDKAgent } from '@mastra/claude';
 import type { HookCallback, SyncHookJSONOutput } from '@anthropic-ai/claude-agent-sdk';
 import { guardToolCall } from './guard.js';
+import { repoRoot } from '../adapters/github.js';
+import type { RepoTarget } from '../adapters/repo-registry.js';
 import { stage } from '../progress.js';
 
 /**
@@ -40,8 +42,16 @@ import { stage } from '../progress.js';
  *
  * 与 `adapters/github.ts` 的 `repoRoot()` 读同一个 env,
  * 保证 checkout / coding / commit 落在同一个仓库。
+ *
+ * ## M5 扩展:可选 `target`（多仓库）
+ *
+ * 传了 `target` 就**完全交给 `adapters/github.ts` 的 `repoRoot(target)`** ——
+ * 由仓库注册表解析本机 clone 路径，并顺带做「旧 env 与注册表矛盾」的显式检测。
+ * 两条路径必须委托而不是各写一份，否则会出现
+ * 「checkout 用注册表的路径、coding 用 env 的路径」这类静默错位（正是 M3 `parseOwnerRepo` 的坑）。
  */
-export function getRepoRoot(): string {
+export function getRepoRoot(target?: RepoTarget): string {
+  if (target) return repoRoot(target);
   const configured = process.env.CODING_REPO_ROOT?.trim();
   if (configured) {
     if (!fs.existsSync(configured)) {
@@ -156,12 +166,26 @@ function buildCodingEnv(): Record<string, string | undefined> {
  *
  * 支持逗号分隔多值;空白项剔除。取不到时返回空数组 —— guard.ts 会退回默认值
  * (`main`/`master`),即**最坏情况是退到原有保护范围,不会退到无保护**。
+ *
+ * ## M5:可选 `target`，取**并集**而不是替换
+ *
+ * 多仓库下每个 target 有自己的 `baseBranch`，红线必须跟着 target 走 ——
+ * 否则「base 改成非 main」的仓库上，`git push origin HEAD:main` 之类的红线会**静默失效**
+ * （M3 已踩过 base 改名导致红线失效）。
+ *
+ * ⚠️ 这里刻意**并入** `GITHUB_BASE_BRANCH` 而不是「有 target 就忽略 env」：
+ * 保护范围只增不减，最坏情况是多保护一个分支（可见的失败），
+ * 而不是少保护一个（静默的越权）。
+ *
+ * @param target 逻辑仓库标识；省略时行为与 M4 逐字一致
  */
-export function resolveProtectedBranchNames(): string[] {
-  return (process.env.GITHUB_BASE_BRANCH ?? '')
+export function resolveProtectedBranchNames(target?: RepoTarget): string[] {
+  const names = (process.env.GITHUB_BASE_BRANCH ?? '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
+  if (target?.baseBranch) names.push(target.baseBranch);
+  return Array.from(new Set(names));
 }
 
 /**
@@ -239,11 +263,11 @@ export function makeGuardHook(repoRoot: string, protectedBranches?: readonly str
  *   PreToolUse hook." → 受保护路径 + 危险命令在此硬拦,见 `makeGuardHook`。
  * - `maxTurns` / `maxBudgetUsd`:无人值守的成本与失控上限。
  */
-export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
+export async function getCodingAgent(cwd?: string, target?: RepoTarget): Promise<ClaudeSDKAgent> {
   // 执行期懒加载 @mastra/claude:其 ESM 依赖(@anthropic-ai/claude-agent-sdk/sdk.mjs)在 jest 等非 ESM
   // 运行时会被解析失败,故不能顶层静态 import,必须推迟到真正跑 coding 步时才加载。
   const { ClaudeSDKAgent: Agent } = await import('@mastra/claude');
-  const repoRoot = cwd || getRepoRoot();
+  const repoRoot = cwd || getRepoRoot(target);
   return new Agent({
     id: 'coding-agent',
     name: 'Coding Agent',
@@ -278,7 +302,7 @@ export async function getCodingAgent(cwd?: string): Promise<ClaudeSDKAgent> {
         // 第二个参数传「实际 base 分支」:围栏的「禁直推 base」不能写死 main/master,
         // 否则 base 改名(如 M3 靶场用别的分支名)后这条红线会静默失效。详见 guard.ts。
         // guard.ts 内部会与默认值取并集,传参只增不减。
-        PreToolUse: [{ hooks: [makeGuardHook(repoRoot, resolveProtectedBranchNames())] }],
+        PreToolUse: [{ hooks: [makeGuardHook(repoRoot, resolveProtectedBranchNames(target))] }],
       },
       // 无人值守的成本与失控上限(可被 env 覆盖)
       maxTurns: Number(process.env.CODING_MAX_TURNS ?? 30),

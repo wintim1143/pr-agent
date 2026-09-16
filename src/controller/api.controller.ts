@@ -3,6 +3,7 @@ import type { Context } from '@midwayjs/koa';
 import { UserService } from '../service/user.service';
 import { mastra } from '../mastra/index';
 import { getFeishuClient } from '../mastra/integrations/feishu';
+import { pollInboundOnce } from '../mastra/adapters/inbound-poll';
 
 /**
  * API 控制器。
@@ -52,6 +53,20 @@ export class APIController {
   /**
    * 飞书 inbound 触发(轮询一轮)。拉最近消息,对每条文本起一个 insight-workflow run。
    * 仅自建应用模式可用;不满足配置时返回明确降级提示。
+   *
+   * ## M5a-2 起:入口有真正的幂等闸与游标
+   *
+   * 原实现只过滤空消息,且 `sinceTs` 每轮都取 `now - 3600` —— 本注释当时自认是
+   * 「最小实现」。一旦把轮询挂上定时器，同一条消息在一小时内会被**重复触发几十次**。
+   *
+   * 现在整段编排挪到 `adapters/inbound-poll.ts`（`pollInboundOnce`）：
+   * - 每条消息先**原子认领**（幂等键 = `messageId`），认领失败即跳过并**在响应里留下可见证据**；
+   * - `sinceTs` 默认从**持久化游标**续读，进程重启不重放历史窗口；
+   * - 去重存储不可写时 **fail-closed**：整轮失败、不起任何新 run。
+   *
+   * 把编排抽出去同时带来一个副作用（刻意的收益）：验证脚本可以注入假的飞书客户端，
+   * 从而**无人值守地**验证「同一 messageId 投 3 次只起 1 个 run」——
+   * 走的是与 HTTP 完全相同的代码路径。
    */
   @Post('/insights/feishu-poll')
   async pollFeishu(@Body() body: any) {
@@ -66,25 +81,18 @@ export class APIController {
     if (!chatId) {
       return { success: false, message: '缺少 chatId(用 body.chatId 或环境变量 FEISHU_RECEIVE_ID)' };
     }
-    const sinceTs =
-      typeof body?.sinceTs === 'number' ? body.sinceTs : Math.floor(Date.now() / 1000) - 3600;
 
-    let messages;
-    try {
-      messages = await client.listMessages(chatId, sinceTs);
-    } catch (e) {
-      return { success: false, message: `拉取飞书消息失败: ${e instanceof Error ? e.message : String(e)}` };
-    }
-
-    const triggered: Array<{ messageId: string; runId: string }> = [];
-    for (const m of messages) {
-      const text = m.text?.trim();
-      if (!text) continue; // 幂等/噪声过滤:空消息跳过(真实去重应在持久化游标上做,此处为最小实现)
-      const wf = mastra.getWorkflow('insight-workflow');
-      const run = await wf.createRun();
-      await run.start({ inputData: { query: text } });
-      triggered.push({ messageId: m.messageId, runId: run.runId });
-    }
-    return { success: true, polled: messages.length, triggered };
+    const res = await pollInboundOnce({
+      source: `feishu:${chatId}`,
+      sinceTs: typeof body?.sinceTs === 'number' ? body.sinceTs : undefined,
+      fetchMessages: sinceTs => client.listMessages(chatId, sinceTs),
+      startRun: async text => {
+        const wf = mastra.getWorkflow('insight-workflow');
+        const run = await wf.createRun();
+        await run.start({ inputData: { query: text } });
+        return run.runId;
+      },
+    });
+    return res.success ? res : { ...res, message: res.error ?? '轮询失败' };
   }
 }

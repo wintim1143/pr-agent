@@ -10,9 +10,12 @@ import {
   gitCommit,
   gitDiffForCommit,
   gitChangedFilesWithStatus,
+  repoRoot,
 } from '../adapters/github';
 import { runTests, detectAgentTouchedTests } from '../adapters/test-runner';
 import type { TestRunResult } from '../adapters/test-runner';
+import { repoKeyOf, type RepoTarget } from '../adapters/repo-registry';
+import { acquireRepoLock, releaseRepoLock } from '../adapters/repo-lock';
 import { stage, stageStart } from '../progress';
 
 /**
@@ -158,10 +161,38 @@ const CommitGateSchema = z.object({
   message: z.string().min(1, 'commit message 不能为空'),
 });
 
-const ContextSchema = z.object({
+/**
+ * ⚠️ 导出仅为单测可达（M5-2 的「schema 内不得出现本机路径」断言必须直接检查 schema 本身，
+ * 而不是检查运行时行为 —— 后者只能证明「这次没传路径」，证明不了「这条约束存在」）。
+ */
+export const ContextSchema = z.object({
   issueNumber: z.number(),
   issueTitle: z.string(),
   issueBody: z.string(),
+  /**
+   * M5:本次 run 的**逻辑**目标仓库（多仓库模式）。
+   *
+   * ## ⚠️ 只允许逻辑标识 —— 本机 clone 路径**绝不**写进来
+   *
+   * 本字段会被序列化进 `mastra.db` 的 workflow snapshot，而 M3-5 已实证
+   * **跨进程 resume 正是靠 snapshot 恢复上下文**。把本机绝对路径写进快照，
+   * 换台机器 resume 就会指向一个不存在的目录 —— 直接把 M3-5 挣来的能力打掉。
+   *
+   * 所以职责这样分：**target 回答「哪个仓库」，仓库注册表回答「它在本机哪里」**。
+   * 运行时由 `repo-registry` 把 target 解析成本机路径（见该文件头）。
+   * 该约束由 `assertLogicalTarget`（每次 `resolveRepoEntry` 都会调用）在运行时守住。
+   *
+   * 字段形状刻意保持**平铺标量**（不用 `.refine()` / `.transform()`）：
+   * 本 schema 同时是 workflow 的 `inputSchema`，需要能转成 JSON Schema，
+   * 自定义校验会破坏这一步（要动就先写 `.tmp/` 探针实测，别只看类型能编译）。
+   */
+  target: z
+    .object({
+      owner: z.string().min(1),
+      repo: z.string().min(1),
+      baseBranch: z.string().min(1),
+    })
+    .optional(),
   /**
    * M2 的「零远端」开关(2026-09-07)。
    *
@@ -300,8 +331,11 @@ function extractJson(text: string | undefined | null): unknown {
  *
  * @param maxChars 截断上限;不传则由 `gitDiffForCommit` 读 `COMMIT_DIFF_MAX_CHARS`(默认 8000)
  */
-function buildChangeContext(maxChars?: number): { text: string; diffChars: number; truncated: boolean } {
-  const { stat, diff, truncated } = gitDiffForCommit(baseBranch(), maxChars);
+function buildChangeContext(
+  maxChars?: number,
+  target?: RepoTarget
+): { text: string; diffChars: number; truncated: boolean } {
+  const { stat, diff, truncated } = gitDiffForCommit(baseBranch(target), maxChars, undefined, target);
   const text =
     `【改动统计】\n${stat || '(无 diff stat)'}\n\n` +
     `【改动内容 diff】\n${diff || '(无 diff 内容 —— 工作树与目标分支均无差异)'}`;
@@ -314,8 +348,12 @@ function buildChangeContext(maxChars?: number): { text: string; diffChars: numbe
  * 2026-09-15（M4）修：原实现把 `'main'` 硬编码在 `buildChangeContext` / 测试脚本里。
  * `GITHUB_BASE_BRANCH` 一旦不是 main（靶场以外都可能改），diff 会静默变空 →
  * 三个闸门全部在「看不见改动」的状态下判负。这类失效不报错，只让闸门恒挂。
+ *
+ * 2026-09-16（M5）：显式 `target` 时**以 target 为准**（多仓库下每个仓库有自己的基线）。
+ * 不传 target 时逐字保持 M4 行为（env → 'main'），使 M1–M4 脚本零改动继续可用。
  */
-function baseBranch(): string {
+function baseBranch(target?: RepoTarget): string {
+  if (target) return target.baseBranch;
   return getGithubConfig()?.baseBranch || process.env.GITHUB_BASE_BRANCH || 'main';
 }
 
@@ -382,16 +420,121 @@ function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
   return lines.filter(l => l !== '').join('\n');
 }
 
+/**
+ * 进入临界区前「解析 target + 抢仓库锁 + 落证据」（M5b-1 / M5b-4）。
+ *
+ * 顺序刻意是「先解析、后加锁」：解析阶段就会因**未知 repoKey / 注册表非法**抛错，
+ * 此时手上还没有锁 —— 若反过来先加锁再解析，一次配置错误就会留下一个要等 TTL 才释放的锁。
+ *
+ * 三条失败语义：
+ * - 未知 repoKey → `resolveRepoEntry` 显式抛错（绝不回退到「当前仓库」，AC-10）
+ * - 锁等待超上限 → 显式抛错，**不降级为「没锁也继续」**（M5 卡 §10：那正是要防的并发损坏）
+ * - 单仓库模式（无 target）→ **完全不加锁**，行为与 M4 逐字一致
+ *
+ * @returns 本机 clone 路径（无 target 时 undefined）
+ */
+async function lockAndDescribeTarget(
+  target: RepoTarget | undefined,
+  holder: string,
+  stageName: string
+): Promise<string | undefined> {
+  if (!target) return undefined;
+  const localPath = repoRoot(target);
+  const repoKey = repoKeyOf(target);
+
+  const res = await acquireRepoLock(repoKey, holder);
+  stage('repo:lock', {
+    stage: stageName,
+    repoKey,
+    holder,
+    acquired: res.acquired,
+    waitedMs: res.waitedMs,
+    // 等待证据：串行保证的可见判据（「有没有等」比「看起来没串台」可信）
+    waited: res.waitedMs > 0,
+    blocker: res.holder && res.holder.holder !== holder ? res.holder.holder : undefined,
+    error: res.error,
+  });
+  if (!res.acquired) {
+    throw new Error(
+      `REPO_LOCK_TIMEOUT@${stageName}: 仓库 ${repoKey} 被 ${res.holder?.holder ?? '(未知持有者)'} 占用，` +
+        `已等待 ${res.waitedMs}ms 超过上限（REPO_LOCK_WAIT_MS）。` +
+        `⚠️ 刻意不降级为「没拿到锁也继续」—— 两个 run 同时操作同一本地工作树，` +
+        `会让 commit 落到**错误的分支**上，且全程不报错。`
+    );
+  }
+  stage('repo:target', { stage: stageName, repoKey, baseBranch: target.baseBranch, localPath });
+  return localPath;
+}
+
+/**
+ * 释放本 run 持有的仓库锁。
+ *
+ * 三处出口都要走到（正常跑完 push-open-pr / `stopAfterCommit` / 未配置 GitHub），
+ * 否则锁只能等 TTL 过期 —— 这期间同仓库的后续 run 会白等。
+ *
+ * ⚠️ 释放**刻意 best-effort 不抛错**：释放失败不该把一个已经成功的 run 变成失败；
+ * 残留锁会在 TTL 后被抢占（见 `repo-lock.ts` 文件头的取舍说明）。
+ */
+async function releaseTargetLock(target: RepoTarget | undefined, holder: string): Promise<void> {
+  if (!target) return;
+  const repoKey = repoKeyOf(target);
+  try {
+    const released = await releaseRepoLock(repoKey, holder);
+    stage('repo:unlock', { repoKey, holder, released });
+  } catch (e) {
+    console.warn(`[repo-lock] 释放 ${repoKey} 的锁失败(将由 TTL 兜底): ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+/**
+ * 终止路径的**统一收口**：先放锁，再落失败事件，最后上抛（M5 实测修订 · 2026-09-16）。
+ *
+ * ## 为什么不能只靠 `push-open-pr` 的 finally（这是实测踩出来的，不是推理出来的）
+ *
+ * 原实现的注释写着「拆出 `runPushOpenPr` 是为了让 `finally` 成为**锁的唯一出口**」——
+ * 这句话**只对了一半**：它覆盖了那一步的四条出路，但八步里 **test / review / commit
+ * 三处闸门判负都在 `push-open-pr` 之前 `throw`**，而「闸门判负」是**设计内的常见出路**
+ * （M4 整个里程碑的主题就是它）。于是每次判负都**泄漏一把锁**，同仓库的后续 run
+ * 要一直等到 `REPO_LOCK_WAIT_MS` 上限才失败。
+ *
+ * 实测证据（`scripts/verify-m5-multirepo.js --multi`，2026-09-16）：
+ * - run `9b0d2725…` 在 review 判 `request-changes` 终止 → 锁仍挂在库里
+ * - 紧接着 run `15311fe2…` 的 checkout `waitedMs=600001` → `REPO_LOCK_TIMEOUT`
+ *   （白等 **10 分钟**，而它本该立刻开始）
+ *
+ * ⚠️ 注意这次失败**不是锁机制错了** —— 锁完全正常工作（它确实挡住了并发）。错的只是
+ * 「释放路径的覆盖度」。所以判据也必须是可数的：「run 终止后锁是否已释放」（见 AC-8）。
+ *
+ * ## 约定
+ *
+ * **每一个可能从 step 里抛出去的 catch 都必须走这里**，不要把 `p.fail(e); throw e`
+ * 写回成裸的两行 —— 那样就少了一次释放。留一把锁的代价是 10 分钟白等 + 一次 AC 失败；
+ * 多走一次 release 的代价是零（`releaseRepoLock` 是 holder 校验 + 幂等，非持有者释放是 no-op）。
+ */
+async function terminateStep(
+  e: unknown,
+  p: { fail: (err: unknown, extra?: Record<string, unknown>) => void } | undefined,
+  target: RepoTarget | undefined,
+  holder: string
+): Promise<never> {
+  await releaseTargetLock(target, holder);
+  if (p) p.fail(e);
+  throw e instanceof Error ? e : new Error(String(e));
+}
+
 // 1. checkout:创建并切到 feature 分支(已接入 GitHub adapter,走本地 git)
 const checkout = createStep({
   id: 'checkout',
   description: '创建并切到 feature 分支 feat/<issue>-<slug>',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const p = stageStart('checkout');
     try {
-      const branch = await githubCheckout(inputData.issueNumber, inputData.issueTitle);
+      // M5b-4：锁必须在**建分支之前**拿到 —— 「抢工作树」这件事本身就是临界区的开始。
+      // holder 用 runId：它天然唯一，且与日志/快照可交叉引用。
+      await lockAndDescribeTarget(inputData.target, runId, 'checkout');
+      const branch = await githubCheckout(inputData.issueNumber, inputData.issueTitle, inputData.target);
       p.done({ branch });
       return { ...inputData, branch };
     } catch (e) {
@@ -401,8 +544,8 @@ const checkout = createStep({
       // 建分支失败没有安全的降级路径,必须显式失败。
       const msg = e instanceof Error ? e.message : String(e);
       console.error(`[checkout] 建分支失败,终止流程(不降级到占位分支名): ${msg}`);
-      p.fail(e);
-      throw e;
+      // M5：本步是**拿锁的那一步**，它自己抛错同样要放锁（否则一次建分支失败就泄漏一把锁）
+      return await terminateStep(e, p, inputData.target, runId);
     }
   },
 });
@@ -433,28 +576,33 @@ const coding = createStep({
   description: '用 ClaudeSDKAgent 在 feature 分支上真正读写文件完成编码',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ inputData }) => {
+  execute: async ({ inputData, runId }) => {
     const p = stageStart('coding');
     // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
     const { getCodingAgent, missingCodingCredentials, getRepoRoot } = await import('../agents/coding-agent.js');
-    if (missingCodingCredentials()) {
-      // 用 error 而非 warn:走到这里意味着「编码这个核心能力根本没执行」,静默降级会让
-      // 后续 test/review/commit 全部基于空结果跑完,表面上全绿实则什么都没做。
-      // 凭据判定逻辑与历史坑见 coding-agent.ts 的 missingCodingCredentials 注释。
-      console.error(
-        '[coding] 未发现任何编码后端凭据,跳过真实编码。已检查:进程 env 的 ANTHROPIC_API_KEY/CLAUDE_API_KEY、' +
-          'CODING_ANTHROPIC_*、以及 ~/.claude/settings.json 的 env 块。' +
-          '若本机 Claude Code 可正常使用,请确认 ~/.claude/settings.json 里存在 env.ANTHROPIC_BASE_URL;' +
-          '否则显式设置 CODING_ANTHROPIC_BASE_URL / CODING_ANTHROPIC_API_KEY。'
-      );
-      // 2026-09-07 改:原先返回占位串继续跑,于是 test/review/commit 基于「什么都没改」的空仓库
-      // 全部跑完,末尾还可能提交一个空 commit —— 表面走完全流程,实质零产出且难判别。
-      // 编码是后续一切闸门的输入,它没跑就等于这次运行没有意义,应当终止。
-      p.fail('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据');
-      throw new Error('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据,编码未执行');
-    }
+    // M5：凭据检查也放进 `try` —— 它同样会 `throw`，而「任何从 step 抛出的错误都必须先放锁」
+    // （约定见 terminateStep 的注释）。原先它写在 `try` 之外，是一处**不会被 catch 覆盖的抛错点**。
     try {
-      const agent = await getCodingAgent(getRepoRoot());
+      if (missingCodingCredentials()) {
+        // 用 error 而非 warn:走到这里意味着「编码这个核心能力根本没执行」,静默降级会让
+        // 后续 test/review/commit 全部基于空结果跑完,表面上全绿实则什么都没做。
+        // 凭据判定逻辑与历史坑见 coding-agent.ts 的 missingCodingCredentials 注释。
+        console.error(
+          '[coding] 未发现任何编码后端凭据,跳过真实编码。已检查:进程 env 的 ANTHROPIC_API_KEY/CLAUDE_API_KEY、' +
+            'CODING_ANTHROPIC_*、以及 ~/.claude/settings.json 的 env 块。' +
+            '若本机 Claude Code 可正常使用,请确认 ~/.claude/settings.json 里存在 env.ANTHROPIC_BASE_URL;' +
+            '否则显式设置 CODING_ANTHROPIC_BASE_URL / CODING_ANTHROPIC_API_KEY。'
+        );
+        // 2026-09-07 改:原先返回占位串继续跑,于是 test/review/commit 基于「什么都没改」的空仓库
+        // 全部跑完,末尾还可能提交一个空 commit —— 表面走完全流程,实质零产出且难判别。
+        // 编码是后续一切闸门的输入,它没跑就等于这次运行没有意义,应当终止。
+        p.fail('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据');
+        throw new Error('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据,编码未执行');
+      }
+      // M5：一次解析、两处复用（agent 的 cwd 与红线都基于同一个 root）——
+      // 各解析一次会让两者有分叉的机会（M3 parseOwnerRepo 的坑就是「两处各解析出不同仓库」）。
+      const root = getRepoRoot(inputData.target);
+      const agent = await getCodingAgent(root, inputData.target);
       const timeoutMs = Number(process.env.CODING_TIMEOUT_MS ?? 600_000);
       const prompt =
         `你在一个 git 仓库的 feature 分支 \`${inputData.branch}\` 上。请实现以下 issue 对应的代码改动:\n\n` +
@@ -466,7 +614,7 @@ const coding = createStep({
 
       // 关键观测点(2026-09-14):编码是唯一「分钟级静默阻塞」的步骤。此处显式打出
       // 「即将调用、超时预算多少」,让使用者知道**等待是预期的**而非挂死。
-      stage('llm:start', { stage: 'coding', timeoutMs, repoRoot: getRepoRoot(), branch: inputData.branch });
+      stage('llm:start', { stage: 'coding', timeoutMs, repoRoot: root, branch: inputData.branch });
 
       // 心跳(2026-09-14):每 HEARTBEAT_MS 打一条,证明进程活着。Claude Code CLI 内部
       // 无法逐轮回调(见下方 stream 方案评估),心跳是当前唯一能区分「慢」与「死」的手段。
@@ -499,9 +647,8 @@ const coding = createStep({
       // 实测依据(2026-09-07):编码因后端 502 超时 600s 后,后续 test 步仍基于空改动继续调用
       // LLM 并因 502 失败,整个 run 变成「两次超时的叠加」,错误信息反而更难读。
       const msg = e instanceof Error ? e.message : String(e);
-      console.error('[coding] ClaudeSDKAgent 执行异常,终止流程:', msg);
-      p.fail(e);
-      throw e;
+      console.error('[coding] 执行异常,终止流程:', msg);
+      return await terminateStep(e, p, inputData.target, runId);
     }
   },
 });
@@ -512,13 +659,13 @@ const testStep = createStep({
   description: '程序真跑测试取 exit code(M4) 并检测测试是否被改动,LLM 只判需求是否实现,程序合成 passed',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ mastra, inputData }) => {
+  execute: async ({ mastra, inputData, runId }) => {
     const p = stageStart('test');
     try {
       // 懒加载取仓库根(与 coding 步同源),避免静态引入 @mastra/claude 干扰框架初始化
       const { getRepoRoot } = await import('../agents/coding-agent.js');
-      const root = getRepoRoot();
-      const change = buildChangeContext();
+      const root = getRepoRoot(inputData.target);
+      const change = buildChangeContext(undefined, inputData.target);
 
       // ================= 程序路 1：真跑测试（M4-1）=================
       // 事实只能由程序产出。这一段与 LLM 无关 —— 模型既不知道它跑没跑，
@@ -542,7 +689,9 @@ const testStep = createStep({
       // ================= 程序路 2：自证检测（M4-5）=================
       // 「跑测试」这件事可不可信，取决于**测试是谁写的**，而不是跑没跑。
       // agent 把既有断言改松，就能给自己发通行证 —— 必须程序侧识别。
-      const touched = detectAgentTouchedTests(gitChangedFilesWithStatus(baseBranch(), root));
+      const touched = detectAgentTouchedTests(
+        gitChangedFilesWithStatus(baseBranch(inputData.target), root, inputData.target)
+      );
       const agentModifiedTests = touched.modified.length > 0;
       stage('test:touch', {
         agentModifiedTests,
@@ -675,8 +824,8 @@ const testStep = createStep({
       p.done({ passed: true, testsPassed, requirementMet: llm.requirementMet });
       return { ...inputData, testResult };
     } catch (e) {
-      p.fail(e);
-      throw e;
+      // M5：本步的判负是「设计内的常见出路」，必须放锁（见 terminateStep 注释）
+      return await terminateStep(e, p, inputData.target, runId);
     }
   },
 });
@@ -687,11 +836,19 @@ const review = createStep({
   description: '调用代码审核 skill,输出 approve 或 request changes',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ mastra, inputData }) => {
+  execute: async ({ mastra, inputData, runId }) => {
     const p = stageStart('review');
     try {
       // 2026-09-15 修:同 test 步 —— 原先只给 issueTitle,review 看不见改动 → 恒判 request-changes。
-      const change = buildChangeContext();
+      // M5 修:必须把 `inputData.target` 传下去。漏传的后果**不是「取不到 diff」，而是「取到了
+      // 另一个仓库的 diff」** —— `buildChangeContext()` 少 target 时会退到 `repoRoot()`，
+      // 而多仓库模式下没有 `CODING_REPO_ROOT`，`repoRoot()` 便回退到**进程 cwd 的 git 顶层**，
+      // 也就是 pr-agent 自己。实测：test 步拿到 307 字符（靶场的 README 改动，正确），
+      // review 步拿到 8028 字符（pr-agent 自身未提交的 M5 改动）→ 审核者正确地判了 request-changes
+      // （它是对的：需求说改 README，diff 里却全是 src/）。
+      // ⚠️ 这个 bug 在 M1–M4 **看不见** —— 那几轮都设了 `CODING_REPO_ROOT`，回退恰好命中正确仓库。
+      // 是「去全局化」把它暴露出来的：去 env 化会把所有隐式回退变成显式错误。
+      const change = buildChangeContext(undefined, inputData.target);
       stage('llm:start', { stage: 'review', diffChars: change.diffChars, truncated: change.truncated });
       const reviewResult = await runGate(
         mastra,
@@ -722,8 +879,8 @@ const review = createStep({
       p.done({ decision: 'approve' });
       return { ...inputData, reviewResult };
     } catch (e) {
-      p.fail(e);
-      throw e;
+      // M5：判负即终止 —— 而终止就必须放锁（实测这条漏了会让同仓库后续 run 白等 10 分钟）
+      return await terminateStep(e, p, inputData.target, runId);
     }
   },
 });
@@ -734,13 +891,14 @@ const commit = createStep({
   description: '调用 commit-message skill 生成 Conventional Commits 并实际提交',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ mastra, inputData }) => {
+  execute: async ({ mastra, inputData, runId }) => {
     const p = stageStart('commit');
     try {
       // 2026-09-15 修:改用公共 helper(不再各写一份 diff 取法),并把「输出契约」逐字写进 prompt。
       // 原实现只写「使用 commit-message skill 生成 commit message」——模型于是按 skill 声明的
       // {type, scope, subject, body} 输出,而 schema 要 {message}:两边对不上,3 次重试全挂。
-      const change = buildChangeContext();
+      // M5 修:同 review 步 —— 必须传 target，否则生成 commit message 的依据是别的仓库的 diff。
+      const change = buildChangeContext(undefined, inputData.target);
       stage('llm:start', { stage: 'commit', diffChars: change.diffChars, truncated: change.truncated });
 
       const commitResult = await runGate(
@@ -757,7 +915,7 @@ const commit = createStep({
       );
       // 真正落盘:把当前改动 commit 到 feature 分支(git add -A + commit)
       try {
-        const r = gitCommit(commitResult.message);
+        const r = gitCommit(commitResult.message, undefined, inputData.target);
         if (!r.committed && r.error && r.error !== 'nothing-to-commit') {
           console.warn('[commit] 未产生提交:', r.error);
         }
@@ -768,11 +926,69 @@ const commit = createStep({
       }
       return { ...inputData, commitResult };
     } catch (e) {
-      p.fail(e);
-      throw e;
+      // M5：本步是临界区（checkout → commit）的**最后一步**，它抛错同样要放锁
+      return await terminateStep(e, p, inputData.target, runId);
     }
   },
 });
+
+/**
+ * push-open-pr 步的主体（与锁的获取/释放解耦）。
+ *
+ * 拆出来是为了让 `finally` 覆盖该步的**四条出路**
+ * （正常返回 / `stopAfterCommit` / 未配置 GitHub / 抛错）——
+ * 分散写四处 release 极易漏掉一条，而漏掉的那条只能等 TTL 过期。
+ *
+ * ⚠️ **2026-09-16 更正**：原注释在这里写着「让 finally 成为锁的**唯一出口**」，那是错的 ——
+ * 它只覆盖了「本步」的出路，而 test / review / commit 三处闸门判负都在本步**之前** throw。
+ * 真正的收口约定见 `terminateStep`（每个可能抛出的 catch 都要放锁），本步的 finally 只是
+ * 其中一条出路。实测泄漏见该函数注释。
+ */
+async function runPushOpenPr(inputData: z.infer<typeof ContextSchema>): Promise<z.infer<typeof ContextSchema>> {
+  if (inputData.stopAfterCommit) {
+    // M2「零远端」:不 push、不开 PR。与「未配置 GitHub」走同一出口(prNumber=0),
+    // 下游 merge 步据此判定无可合对象。
+    return { ...inputData, prNumber: 0 };
+  }
+  if (!getGithubConfig(inputData.target)) {
+    // 未配置 GitHub → 跳过,prNumber 保持 0,不阻断后续 notify/merge
+    return { ...inputData, prNumber: 0 };
+  }
+  const p = stageStart('push-open-pr');
+  try {
+    const res = await githubPushAndOpenPR({
+      branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
+      title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
+      body: buildPrBody(inputData),
+      target: inputData.target,
+    });
+    if (res.error) {
+      // ⚠️ M3 起**显式阻断**,不再只 console.warn 后继续往下走。
+      // 原因(2026-09-15 · M3-3):推不动远端却继续,流程会走到 merge 步并
+      // suspend 等人 approve —— 那是一个**永远不会被点掉的挂起**(根本没有 PR 可合)。
+      // 静默失败比崩溃更难排查:M2 零远端时「继续」的代价只是白跑一遍,
+      // M3 真写远端后,判断依据(有没有 PR)与流程状态(等 approve)会互相矛盾。
+      // M3 卡 §10 异常表:影响远端的失败必须显式阻断,不得降级为「仅告警」。
+      p.fail(res.error);
+      throw new Error(`[push-open-pr] 失败: ${res.error}`);
+    } else if (res.skipped) {
+      console.warn('[push-open-pr] 未配置 GitHub,已跳过');
+      p.done({ skipped: true });
+    } else if (res.prUrl) {
+      console.log('[push-open-pr] PR 已开:', res.prUrl);
+      p.done({ prNumber: res.prNumber, prUrl: res.prUrl });
+    } else {
+      p.done({});
+    }
+    // M3-4:把 PR 链接一并带进上下文,供 notify 步渲染成卡片上的可点链接。
+    // 注意 `?? undefined`:`PushPrResult.prUrl` 是 `string | null`,而 ContextSchema
+    // 的 prUrl 是 `z.string().optional()`(不接受 null)。直接透传会让 zod 校验失败。
+    return { ...inputData, prNumber: res.prNumber, prUrl: res.prUrl ?? undefined };
+  } catch (e) {
+    p.fail(e);
+    throw e;
+  }
+}
 
 // 6. push + open PR(已接入 GitHub adapter:git push + REST POST /repos/{o}/{r}/pulls)
 const pushOpenPr = createStep({
@@ -780,48 +996,13 @@ const pushOpenPr = createStep({
   description: 'push feature 分支并开 PR',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ inputData }) => {
-    if (inputData.stopAfterCommit) {
-      // M2「零远端」:不 push、不开 PR。与「未配置 GitHub」走同一出口(prNumber=0),
-      // 下游 merge 步据此判定无可合对象。
-      return { ...inputData, prNumber: 0 };
-    }
-    if (!getGithubConfig()) {
-      // 未配置 GitHub → 跳过,prNumber 保持 0,不阻断后续 notify/merge
-      return { ...inputData, prNumber: 0 };
-    }
-    const p = stageStart('push-open-pr');
+  execute: async ({ inputData, runId }) => {
     try {
-      const res = await githubPushAndOpenPR({
-        branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
-        title: `${inputData.issueTitle} (#${inputData.issueNumber})`,
-        body: buildPrBody(inputData),
-      });
-      if (res.error) {
-        // ⚠️ M3 起**显式阻断**,不再只 console.warn 后继续往下走。
-        // 原因(2026-09-15 · M3-3):推不动远端却继续,流程会走到 merge 步并
-        // suspend 等人 approve —— 那是一个**永远不会被点掉的挂起**(根本没有 PR 可合)。
-        // 静默失败比崩溃更难排查:M2 零远端时「继续」的代价只是白跑一遍,
-        // M3 真写远端后,判断依据(有没有 PR)与流程状态(等 approve)会互相矛盾。
-        // M3 卡 §10 异常表:影响远端的失败必须显式阻断,不得降级为「仅告警」。
-        p.fail(res.error);
-        throw new Error(`[push-open-pr] 失败: ${res.error}`);
-      } else if (res.skipped) {
-        console.warn('[push-open-pr] 未配置 GitHub,已跳过');
-        p.done({ skipped: true });
-      } else if (res.prUrl) {
-        console.log('[push-open-pr] PR 已开:', res.prUrl);
-        p.done({ prNumber: res.prNumber, prUrl: res.prUrl });
-      } else {
-        p.done({});
-      }
-      // M3-4:把 PR 链接一并带进上下文,供 notify 步渲染成卡片上的可点链接。
-      // 注意 `?? undefined`:`PushPrResult.prUrl` 是 `string | null`,而 ContextSchema
-      // 的 prUrl 是 `z.string().optional()`(不接受 null)。直接透传会让 zod 校验失败。
-      return { ...inputData, prNumber: res.prNumber, prUrl: res.prUrl ?? undefined };
-    } catch (e) {
-      p.fail(e);
-      throw e;
+      return await runPushOpenPr(inputData);
+    } finally {
+      // M5b-4：本步是临界区的**最后一步**（checkout → coding → test → review → commit → push），
+      // 因此锁在这里释放。用 finally 保证「四条出路都释放」，包括抛错那条。
+      await releaseTargetLock(inputData.target, runId);
     }
   },
 });
@@ -935,7 +1116,7 @@ const merge = createStep({
       return { ...inputData, mergeResult };
     }
     try {
-      const res = await githubMergePR(inputData.prNumber);
+      const res = await githubMergePR(inputData.prNumber, { target: inputData.target });
       const mergeResult = res.merged
         ? `merge-ok: PR #${inputData.prNumber} 已 squash 合入(sha=${res.sha})`
         : `merge-fail: ${res.message ?? '未知原因'}`;
