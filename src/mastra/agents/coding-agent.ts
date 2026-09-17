@@ -199,8 +199,15 @@ export function resolveProtectedBranchNames(target?: RepoTarget): string[] {
  * 理由:误拒会让流水线明显报错(可观测),误放行则是静默绕过(不可观测)。
  *
  * @param protectedBranches 额外受保护的分支(实际 base 分支)。与 guard 内部默认值取并集。
+ * @param runId M6-2：本 hook 由哪个 run 的 coding 步装配。用于让 `guard:deny` 归得到 run
+ *   —— 红线生效的证据若归不到 run,多 run 交错时就无法回答「哪一次被拦了」。
+ *   省略时落 `runId: null`（`trace:missing` 会把它暴露出来，不静默）。
  */
-export function makeGuardHook(repoRoot: string, protectedBranches?: readonly string[]): HookCallback {
+export function makeGuardHook(
+  repoRoot: string,
+  protectedBranches?: readonly string[],
+  runId: string | null = null
+): HookCallback {
   return async input => {
     const deny = (reason: string): SyncHookJSONOutput => ({
       // 新版判定字段(SDK 推荐)
@@ -225,11 +232,13 @@ export function makeGuardHook(repoRoot: string, protectedBranches?: readonly str
 
       const verdict = guardToolCall(toolName, toolInput, repoRoot, protectedBranches);
       if (verdict.decision === 'deny') {
-        console.warn(`[permission-guard] deny ${toolName}: ${verdict.reason}`);
         // 埋点(M3-6):红线生效必须留下**可追溯**证据。
         // 只记工具名与原因摘要 —— 入参可能含凭据(`.env`、token),不进日志。
+        // M6-1/M6-2:原先还多打一行 `console.warn`。那是**纯重复** ——
+        // 事件本身就会镜像到终端（失败类事件走 stderr),再打一遍只会让日志双份。
         stage('guard:deny', {
           stage: 'coding',
+          runId,
           tool: toolName,
           reason: verdict.reason.slice(0, 200),
         });
@@ -263,7 +272,11 @@ export function makeGuardHook(repoRoot: string, protectedBranches?: readonly str
  *   PreToolUse hook." → 受保护路径 + 危险命令在此硬拦,见 `makeGuardHook`。
  * - `maxTurns` / `maxBudgetUsd`:无人值守的成本与失控上限。
  */
-export async function getCodingAgent(cwd?: string, target?: RepoTarget): Promise<ClaudeSDKAgent> {
+export async function getCodingAgent(
+  cwd?: string,
+  target?: RepoTarget,
+  runId: string | null = null
+): Promise<ClaudeSDKAgent> {
   // 执行期懒加载 @mastra/claude:其 ESM 依赖(@anthropic-ai/claude-agent-sdk/sdk.mjs)在 jest 等非 ESM
   // 运行时会被解析失败,故不能顶层静态 import,必须推迟到真正跑 coding 步时才加载。
   const { ClaudeSDKAgent: Agent } = await import('@mastra/claude');
@@ -302,7 +315,7 @@ export async function getCodingAgent(cwd?: string, target?: RepoTarget): Promise
         // 第二个参数传「实际 base 分支」:围栏的「禁直推 base」不能写死 main/master,
         // 否则 base 改名(如 M3 靶场用别的分支名)后这条红线会静默失效。详见 guard.ts。
         // guard.ts 内部会与默认值取并集,传参只增不减。
-        PreToolUse: [{ hooks: [makeGuardHook(repoRoot, resolveProtectedBranchNames(target))] }],
+        PreToolUse: [{ hooks: [makeGuardHook(repoRoot, resolveProtectedBranchNames(target), runId)] }],
       },
       // 无人值守的成本与失控上限(可被 env 覆盖)
       maxTurns: Number(process.env.CODING_MAX_TURNS ?? 30),

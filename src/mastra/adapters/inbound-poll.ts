@@ -26,6 +26,7 @@
  * （每个重复 run 都在真金白银地跑 coding + review）。
  */
 import { advanceCursor, attachRunId, claimEvent, getCursor } from './dedup-store.js';
+import { stage } from '../progress';
 
 /** 与 `FeishuInboundMessage` 结构兼容的最小子集（不 import 飞书模块，保持本模块可独立单测）。 */
 export interface InboundMessage {
@@ -172,7 +173,18 @@ export async function pollInboundOnce(opts: PollInboundOptions): Promise<PollInb
     } catch (e) {
       // 认领已成功（去重能力不受影响），只是「事件 → run」的反查索引缺失。
       // 因此只告警不失败 —— 把一个已经起起来的 run 判成失败，代价更大。
-      console.warn(`[inbound-poll] 回填 runId 失败（不影响去重）：${e instanceof Error ? e.message : e}`);
+      //
+      // M6-1：原先只 console.warn。**这条尤其不能只活在终端里** ——
+      // 它记录的正是「事件→run 的反查能力缺失」，而 M6 的整个目标就是这条反查
+      // （`queryByRun`）。落成结构化事件后，验收脚本能直接数出它发生过几次。
+      stage('inbound:error', {
+        stage: 'inbound',
+        runId,
+        kind: 'attach-run-id-failed',
+        messageId: m.messageId,
+        error: e instanceof Error ? e.message : String(e),
+        note: '去重不受影响（认领已成功），仅事件→run 反查索引缺失',
+      });
     }
     triggered.push({ messageId: m.messageId, runId });
   }
@@ -183,7 +195,18 @@ export async function pollInboundOnce(opts: PollInboundOptions): Promise<PollInb
     cursorAfter = await advanceCursor(source, maxTs);
   } catch (e) {
     // run 已经起完了，此处失败只影响「下次少扫一点」，不该把本轮判成失败。
-    console.warn(`[inbound-poll] 推进游标失败（不影响本轮结果）：${e instanceof Error ? e.message : e}`);
+    // M6-1：原先只 console.warn —— 「游标没推进」会让下一轮**重复扫同一窗口**，
+    // 是「为什么同一条消息又出现了」这类疑问的直接线索，必须可查。
+    stage('inbound:error', {
+      stage: 'inbound',
+      runId: triggered.length ? triggered[triggered.length - 1].runId : null,
+      kind: 'advance-cursor-failed',
+      source,
+      sinceTs,
+      maxTs,
+      error: e instanceof Error ? e.message : String(e),
+      note: 'run 已起完，本轮结果不受影响；仅影响下轮窗口起点',
+    });
     cursorAfter = cursorBefore ?? sinceTs;
   }
 

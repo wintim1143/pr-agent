@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import type { OpenAICompatibleConfig } from '@mastra/core/llm';
+import { stage } from './progress';
 import {
   resolveLlmProvider,
   toMastraModelConfig,
@@ -93,14 +94,35 @@ export function checkLlmConfig(): LlmConfigIssue[] {
 /**
  * 打印一行配置摘要供日志使用(**不含密钥**)。
  * 在服务启动时调用一次,即可在日志里看到本次实际生效的 provider / model / baseURL。
+ *
+ * ## M6-1（2026-09-17）：收编裸 `console.*`
+ *
+ * 原实现直接 `console.log` / `console.error` —— 终端一关，「这次到底连的是哪个端点、
+ * 哪几项配置缺了」就**无法从任何持久化文件里复原**。而它恰恰是排障时第一个要看的东西
+ * （历史事故：中继 403 时无从判断是映射错还是 key 失效）。
+ *
+ * 现在统一走结构化事件 `config:check`（`stage: 'startup'`、`runId: null` ——
+ * 启动期不属于任何 run，这是规范允许 `null` 的三种阶段之一）。
  */
 export function logLlmConfig(prefix = '[llm]'): void {
   const issues = checkLlmConfig();
-  console.log(`${prefix} ${describeProvider(resolvedLlm)}`);
   const hasError = issues.some(x => x.level === 'error');
-  const emit = hasError ? console.error : console.warn;
+  stage('config:check', {
+    stage: 'startup',
+    runId: null,
+    level: hasError ? 'error' : 'info',
+    prefix,
+    summary: describeProvider(resolvedLlm),
+  });
   for (const i of issues) {
-    emit(`${prefix} ${i.level === 'error' ? '✗' : '⚠'} ${i.field}: ${i.message}`);
+    stage('config:check', {
+      stage: 'startup',
+      runId: null,
+      level: i.level,
+      prefix,
+      field: i.field,
+      message: i.message,
+    });
   }
 }
 

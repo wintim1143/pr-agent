@@ -4,6 +4,8 @@ import type { Agent } from '@mastra/core/agent';
 import { getGithubReadonlyClient } from '../integrations/github-readonly';
 import { getFeishuClient } from '../integrations/feishu';
 import { feishuNotify } from '../adapters/feishu';
+import { normalizeUsage } from '../log-store';
+import { runEnd, runStart, runSuspend, stage, stageStart } from '../progress';
 
 /**
  * M1 只读洞察闭环 workflow(对应里程碑卡 §6 M1-4)。
@@ -58,36 +60,64 @@ const InsightContextSchema = z.object({
 const LLM_TIMEOUT_MS = Number(process.env.M1_LLM_TIMEOUT_MS) || 45_000;
 const LLM_MAX_ATTEMPTS = Math.max(1, Number(process.env.M1_LLM_ATTEMPTS) || 3);
 
+/** 统一的错误文本化（M6-1）。 */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** 从 Mastra `generate()` 结果里取 token 用量（M6-4）；拿不到 → 归一成 null，不是 0。 */
+function usageOf(res: unknown): unknown {
+  if (!res || typeof res !== 'object') return undefined;
+  const r = res as { usage?: unknown; totalUsage?: unknown };
+  return r.usage ?? r.totalUsage;
+}
+
+/**
+ * @param runId M6-2：来自 summarize 步的 execute 上下文。本函数是模块级工具函数，
+ *   **拿不到** runId —— 所以必须由调用方**显式传进来**；否则其内部的重试/降级事件
+ *   会归不到 run（`trace:missing` 会把这种遗漏暴露成可数事实，不静默）。
+ */
 async function generateInsight(
   agent: Agent,
-  prompt: string
+  prompt: string,
+  runId: string | null
 ): Promise<{ insight: z.infer<typeof InsightSchema>; degraded: boolean; lastError?: string }> {
   let lastError = '';
   for (let attempt = 1; attempt <= LLM_MAX_ATTEMPTS; attempt++) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
+    const t0 = Date.now();
     try {
+      stage('llm:start', { stage: 'summarize', runId, attempt, maxAttempts: LLM_MAX_ATTEMPTS, timeoutMs: LLM_TIMEOUT_MS });
       const res = await agent.generate(prompt, { abortSignal: ctrl.signal });
       clearTimeout(timer);
       const text = (res.text ?? '').toString();
       const m = text.match(/\{[\s\S]*\}/);
       if (!m) {
         lastError = '模型未返回 JSON';
-        console.warn(`[summarize] 第 ${attempt}/${LLM_MAX_ATTEMPTS} 次:${lastError},重试`);
+        // M6-1：原先只 console.warn（随会话消失）。落结构化事件，终端的镜像由 logger 统一给。
+        stage('llm:retry', { stage: 'summarize', runId, attempt, error: lastError, durationMs: Date.now() - t0 });
         continue;
       }
       try {
         const parsed = InsightSchema.parse(JSON.parse(m[0]));
+        stage('llm:done', {
+          stage: 'summarize',
+          runId,
+          attempt,
+          durationMs: Date.now() - t0,
+          usage: normalizeUsage(usageOf(res)),
+        });
         return { insight: parsed, degraded: false };
       } catch (e) {
         lastError = `JSON 结构校验失败:${(e as Error).message}`;
-        console.warn(`[summarize] 第 ${attempt}/${LLM_MAX_ATTEMPTS} 次:${lastError},重试`);
+        stage('llm:retry', { stage: 'summarize', runId, attempt, error: lastError, durationMs: Date.now() - t0 });
         continue;
       }
     } catch (e) {
       clearTimeout(timer);
-      lastError = e instanceof Error ? e.message : String(e);
-      console.warn(`[summarize] 第 ${attempt}/${LLM_MAX_ATTEMPTS} 次生成失败(${lastError}),重试`);
+      lastError = errorText(e);
+      stage('llm:retry', { stage: 'summarize', runId, attempt, error: lastError, durationMs: Date.now() - t0 });
       continue;
     }
   }
@@ -104,17 +134,29 @@ const collect = createStep({
   description: '调用 GitHub 只读集成拉取 issue 与 commits',
   inputSchema: InsightContextSchema,
   outputSchema: InsightContextSchema,
-  execute: async ({ inputData }) => {
-    const client = getGithubReadonlyClient();
-    if (!client) {
-      console.warn('[collect] GitHub 未配置,跳过数据拉取(issue/commit 为空)');
-      return { ...inputData, issues: [], commits: [] };
+  execute: async ({ inputData, runId }) => {
+    // M6-5：本工作流没有 `terminateStep` 那样的失败收口（四步都不抛异常）,
+    // 所以 run:start / run:end 在这里就地落。collect 是第一步 → 落 start。
+    runStart({ stage: 'collect', runId, workflow: 'insight-workflow', query: inputData.query });
+    const p = stageStart({ stage: 'collect', runId });
+    try {
+      const client = getGithubReadonlyClient();
+      if (!client) {
+        // M6-1：原先只 console.warn。收编成 step:done 的字段（「跳过」也要留痕）。
+        p.done({ skipped: true, note: 'GitHub 未配置,跳过数据拉取(issue/commit 为空)' });
+        return { ...inputData, issues: [], commits: [] };
+      }
+      const [issues, commits] = await Promise.all([
+        client.listIssues({ state: 'all', perPage: 10 }),
+        client.listCommits({ perPage: 10 }),
+      ]);
+      p.done({ issues: issues.length, commits: commits.length });
+      return { ...inputData, issues, commits };
+    } catch (e) {
+      p.fail(e);
+      runEnd({ stage: 'collect', runId, status: 'failed', failedStage: 'collect', reason: errorText(e).slice(0, 300) });
+      throw e;
     }
-    const [issues, commits] = await Promise.all([
-      client.listIssues({ state: 'all', perPage: 10 }),
-      client.listCommits({ perPage: 10 }),
-    ]);
-    return { ...inputData, issues, commits };
   },
 });
 
@@ -128,23 +170,30 @@ const summarize = createStep({
     '用 insight-agent 汇总洞察(plain generate + 解析 JSON,带超时/重试/降级,兼容不支持 structured output 的中继)',
   inputSchema: InsightContextSchema,
   outputSchema: InsightContextSchema,
-  execute: async ({ mastra, inputData }) => {
-    const agent = mastra.getAgent('insight-agent');
-    const data =
-      `仓库近期 issue(${inputData.issues?.length ?? 0}):\n` +
-      (inputData.issues ?? []).map(i => `#${i.number} [${i.state}] ${i.title}`).join('\n') +
-      `\n\n近期 commit(${inputData.commits?.length ?? 0}):\n` +
-      (inputData.commits ?? []).map(c => `${c.sha.slice(0, 7)} ${c.message} (@${c.author})`).join('\n');
-    const prompt = `请基于以下 GitHub 数据产出项目洞察,**只输出一个 JSON 对象**(不要输出 JSON 以外的任何文字),结构为:
+  execute: async ({ mastra, inputData, runId }) => {
+    const p = stageStart({ stage: 'summarize', runId });
+    try {
+      const agent = mastra.getAgent('insight-agent');
+      const data =
+        `仓库近期 issue(${inputData.issues?.length ?? 0}):\n` +
+        (inputData.issues ?? []).map(i => `#${i.number} [${i.state}] ${i.title}`).join('\n') +
+        `\n\n近期 commit(${inputData.commits?.length ?? 0}):\n` +
+        (inputData.commits ?? []).map(c => `${c.sha.slice(0, 7)} ${c.message} (@${c.author})`).join('\n');
+      const prompt = `请基于以下 GitHub 数据产出项目洞察,**只输出一个 JSON 对象**(不要输出 JSON 以外的任何文字),结构为:
 {"highlights":["值得关注的进展,3-5 条"],"risks":["潜在风险或技术债信号"],"suggestions":["给维护者的可执行建议"]}
 
 ${data}`;
 
-    const { insight, degraded, lastError } = await generateInsight(agent, prompt);
-    if (degraded) {
-      console.warn(`[summarize] LLM 不可用,降级为空洞察(最后错误:${lastError})`);
+      const { insight, degraded, lastError } = await generateInsight(agent, prompt, runId);
+      // M6-1：降级是**语义上重要的**事实（洞察内容是空的，不是「没有风险」），
+      // 必须落结构化事件 —— 原先只有一行 console.warn。
+      p.done({ degraded, ...(degraded ? { lastError: (lastError ?? '').slice(0, 300) } : {}) });
+      return { ...inputData, insight, llmUnavailable: degraded };
+    } catch (e) {
+      p.fail(e);
+      runEnd({ stage: 'summarize', runId, status: 'failed', failedStage: 'summarize', reason: errorText(e).slice(0, 300) });
+      throw e;
     }
-    return { ...inputData, insight, llmUnavailable: degraded };
   },
 });
 
@@ -155,7 +204,10 @@ const notify = createStep({
   inputSchema: InsightContextSchema,
   outputSchema: InsightContextSchema,
   execute: async ({ inputData, runId }) => {
+    // M6-1：早退路径也落 step 事件（「为什么没发卡片」是排障时第一个要问的问题）。
+    const p = stageStart({ stage: 'notify', runId });
     if (!getFeishuClient()) {
+      p.done({ skipped: true, note: '飞书未配置,跳过通知' });
       return { ...inputData, cardSent: false };
     }
     const ins = inputData.insight;
@@ -179,14 +231,27 @@ const notify = createStep({
         title: '📊 仓库洞察',
         markdown: md.join('\n'),
         buttons: [
+          // ⚠️ M7 待改：这里仍是拼接标识 `confirm_<runId>`。
+          // 已拍板改为**结构化 value**（`{kind:'insight', action:'confirm'|'rerun', runId}`），
+          // 见 `milestones/M7-飞书双向控制.md` §0.1 第 3 条 与 §7 M7-4 —— M6 范围不含卡片。
           { text: '✅ 确认', value: `confirm_${runId}`, type: 'primary' },
           { text: '🔄 重跑', value: `rerun_${runId}`, type: 'default' },
         ],
       });
-      if (!res.ok) console.warn(`[notify] 飞书推送失败(mode=${res.mode}):`, res.error || JSON.stringify(res.raw));
-      return { ...inputData, cardSent: res.ok };
+      if (!res.ok) {
+        // M6-1：原先只 console.warn。卡片没发出去 → 后续按钮回调永远等不到，
+        // 这条事实必须在文件里（否则只能靠「群里没看到」来推断）。
+        p.fail(`飞书推送失败(mode=${res.mode})`, {
+          mode: res.mode,
+          feishuError: res.error ?? null,
+          raw: res.raw ? JSON.stringify(res.raw).slice(0, 300) : null,
+        });
+        return { ...inputData, cardSent: false };
+      }
+      p.done({ mode: res.mode });
+      return { ...inputData, cardSent: true };
     } catch (e) {
-      console.warn('[notify] 飞书推送异常:', e instanceof Error ? e.message : e);
+      p.fail(e);
       return { ...inputData, cardSent: false };
     }
   },
@@ -199,15 +264,28 @@ const confirm = createStep({
   inputSchema: InsightContextSchema,
   outputSchema: InsightContextSchema,
   execute: async ({ inputData, suspend, resumeData, runId }) => {
+    const p = stageStart({ stage: 'confirm', runId });
     // 未收到 resume → 挂起,等飞书卡片点「确认/重跑」后回调 resume(或手工打 resume 端点)
     if (!resumeData) {
+      // M6-5：挂起用 `run:suspend` 表达,**不是** `step:start`
+      // （借 step:start 会造出一个没有配对的 start，污染 AC-4 的配对判据）。
+      runSuspend({ stage: 'confirm', runId, waitingFor: 'insight-confirm' });
       return suspend({ waitingFor: 'insight-confirm', runId });
     }
     // 已 resume:记录反馈(action 来自卡片按钮 value,approved 来自手工 resume 端点)
     const action = (resumeData as { action?: string }).action;
     const approved = (resumeData as { approved?: boolean }).approved;
     const feedback = action === 'rerun' ? 'rerun' : approved ? 'confirmed' : 'dismissed';
-    console.log(`[confirm] run ${runId} 收到人工反馈: ${feedback}`);
+    p.done({ feedback, action: action ?? null });
+    // M6-5：本步是终点 → 落唯一一条 run:end。
+    // `rerun` 归为 `rejected`：它表示**人工不接受本次洞察产物**（要重跑），
+    // 与「确认」是两种相反的结论，用 `ok` 记会把两者混成一种。
+    runEnd({
+      stage: 'confirm',
+      runId,
+      status: feedback === 'rerun' ? 'rejected' : 'ok',
+      reason: `人工反馈: ${feedback}`,
+    });
     return { ...inputData, feedback };
   },
 });

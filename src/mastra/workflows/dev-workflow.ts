@@ -16,7 +16,8 @@ import { runTests, detectAgentTouchedTests } from '../adapters/test-runner';
 import type { TestRunResult } from '../adapters/test-runner';
 import { repoKeyOf, type RepoTarget } from '../adapters/repo-registry';
 import { acquireRepoLock, releaseRepoLock } from '../adapters/repo-lock';
-import { stage, stageStart } from '../progress';
+import { normalizeUsage } from '../log-store';
+import { runEnd, runStart, runSuspend, stage, stageStart, type StageName } from '../progress';
 
 /**
  * 流水线阶段事件埋点(2026-09-14 新增,解决「长等待期无法感知 agent 是否在跑」)。
@@ -26,8 +27,17 @@ import { stage, stageStart } from '../progress';
  * 「LLM 正在思考」/「上游挂死」/「子进程已崩」,只能靠 Claude Code 的会话 jsonl
  * 事后考古。埋点后可用 `tail -f logs/dev-workflow.log` 实时观察进度。
  *
- * 事件类型:`step:start` / `step:done` / `step:fail` / `llm:start` / `llm:done` / `llm:retry`
- * 详见 `src/mastra/progress.ts`。
+ * 事件类型与字段规范见 `docs/日志规范.md`;写 API 见 `src/mastra/progress.ts`。
+ *
+ * ## ⚠️ M6-2（2026-09-17）：`runId` 必须来自 step 的 execute 上下文
+ *
+ * `execute: async ({ inputData, runId })` 里的 `runId` 是 **Mastra 免费给的**,
+ * 不需要自己发明 trace 传递机制。八步**全部**要把它透传给每一个 `stage()` / `stageStart()`
+ * —— 漏一处,那一处的事件就归不到 run（`trace:missing` 会把它暴露出来）。
+ *
+ * commit 前的历史教训:原签名 `stageStart(stageName: string, runId?: string)` 两个形参都是
+ * string,于是 `stageStart('merge', 'rejected')` 把语义串塞进了 runId 槽而**编译器不报错**。
+ * 现在参数是对象且 `runId` 必填,误用是编译错误。
  */
 
 /**
@@ -221,6 +231,52 @@ export const ContextSchema = z.object({
   mergeResult: z.string().optional(),
 });
 /**
+ * 从 Mastra `generate()` 的结果里取 token 用量（M6-4）。
+ *
+ * 取 `usage`（**最后一步**的用量）优先，退到 `totalUsage`（全部步骤合计）。
+ * 本项目闸门都是一次 plain generate（无多步 tool-calling 循环），两者等价。
+ *
+ * 拿不到就返回 `undefined` → 上游 `normalizeUsage()` 归一成 `null`。
+ * ⚠️ **不做「取不到就当 0」** 的兜底：那是把「未知」伪装成「确定值」，
+ * 与 M4 的 `testsPassed = null ≠ true` 是同一类错误。
+ */
+function usageOf(res: unknown): unknown {
+  if (!res || typeof res !== 'object') return undefined;
+  const r = res as { usage?: unknown; totalUsage?: unknown };
+  return r.usage ?? r.totalUsage;
+}
+
+/** 统一的错误文本化（M6-1：原来每处 `e instanceof Error ? e.message : String(e)` 各写一遍）。 */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * 「闸门判负」这类**设计内失败**的载体（M6-5 新增）。
+ *
+ * ## 为什么需要它：原先一个 step 会落**两条** `step:fail`
+ *
+ * 历史写法是在判负处先 `p.fail(msg, {...})`（带上下文），再 `throw new Error(msg)`；
+ * 异常冒泡到本步的 catch → `terminateStep` → **又 `p.fail(e)` 一次**。
+ * 于是 `step:start` 一条、`step:fail` 两条 ——
+ * 这正是 M6 侦察时在历史日志里量到的那个不对称
+ * （`step:start` 141 vs `step:done + step:fail` 146，多 5 个 end）的成因之一。
+ *
+ * ## 修法：把「带上下文的失败」变成**一个异常**，而不是两次调用
+ *
+ * 判负处只 `throw new StepFailError(msg, extra)`，`p.fail` 由 `terminateStep` 唯一负责
+ * —— **一个 step 一个出口**，配对判据（AC-4）才有意义。
+ */
+class StepFailError extends Error {
+  readonly extra: Record<string, unknown>;
+  constructor(message: string, extra: Record<string, unknown> = {}) {
+    super(message);
+    this.name = 'StepFailError';
+    this.extra = extra;
+  }
+}
+
+/**
  * 用 dev-agent 跑质量闸门 skill,输出结构化结果(文档 P3-1)。
  *
  * ## 为什么不走 Mastra `structuredOutput`(2026-09-07 修复)
@@ -234,8 +290,16 @@ export const ContextSchema = z.object({
  * 解析失败仍抛错(fail-closed,与原 strict 策略语义一致)—— 闸门宁可不通过,不能假通过。
  *
  * ⚠️ 导出仅为单测可达(M4-6 的「重试回灌」必须断言第二次调用收到的 prompt)。
+ *
+ * @param runId 来自 step 的 execute 上下文（M6-2）。默认 `null` 仅为兼容单测的 3 参调用；
+ *   正式路径（test / review / commit 三步）**必须**传真值,否则闸门的 llm 事件归不到 run。
  */
-export async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instruction: string, schema: S): Promise<z.infer<S>> {
+export async function runGate<S extends z.ZodTypeAny>(
+  mastra: Mastra,
+  instruction: string,
+  schema: S,
+  runId: string | null = null
+): Promise<z.infer<S>> {
   const agent = mastra.getAgent('dev-agent');
   const basePrompt = `${instruction}\n\n【输出格式(强制)】最终回答只输出一个 JSON 对象,不要包含任何解释性文字或代码围栏以外的内容。`;
   // 重试(2026-09-07 补):glm 中继偶发**空响应**(res.text 为空,2026-09-07 review 步实测),
@@ -266,7 +330,7 @@ export async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instructio
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const prompt = feedback ? `${basePrompt}\n\n${feedback}` : basePrompt;
-      stage('llm:start', { stage: 'gate', attempt, maxAttempts, withFeedback: Boolean(feedback) });
+      stage('llm:start', { stage: 'gate', runId, attempt, maxAttempts, withFeedback: Boolean(feedback) });
       const res = await agent.generate(prompt);
       const obj = extractJson(res.text);
       const parsed = schema.safeParse(obj);
@@ -276,12 +340,19 @@ export async function runGate<S extends z.ZodTypeAny>(mastra: Mastra, instructio
             ` | 模型原文(前 200 字): ${String(res.text).slice(0, 200)}`,
         );
       }
-      stage('llm:done', { stage: 'gate', attempt, durationMs: Date.now() - t0 });
+      // M6-4：token 用量回写。拿不到就是 null —— **绝不可写 0**（0 会被成本报表当成真值）。
+      stage('llm:done', {
+        stage: 'gate',
+        runId,
+        attempt,
+        durationMs: Date.now() - t0,
+        usage: normalizeUsage(usageOf(res)),
+      });
       return parsed.data as z.infer<S>;
     } catch (e) {
       lastErr = e instanceof Error ? e : new Error(String(e));
-      console.warn(`[runGate] 第 ${attempt}/${maxAttempts} 次闸门调用失败: ${lastErr.message}`);
-      stage('llm:retry', { stage: 'gate', attempt, maxAttempts, error: lastErr.message.slice(0, 200) });
+      // M6-1：原先这里只 console.warn，终端一关就没有了。落结构化事件 + 保留人类可读镜像。
+      stage('llm:retry', { stage: 'gate', runId, attempt, maxAttempts, error: lastErr.message.slice(0, 200) });
       feedback =
         `【上一次尝试失败,请据此修正】\n` +
         `错误类型: ${lastErr.message.split(':')[0]}\n` +
@@ -431,12 +502,15 @@ function buildPrBody(ctx: z.infer<typeof ContextSchema>): string {
  * - 锁等待超上限 → 显式抛错，**不降级为「没锁也继续」**（M5 卡 §10：那正是要防的并发损坏）
  * - 单仓库模式（无 target）→ **完全不加锁**，行为与 M4 逐字一致
  *
+ * @param runId M6-2：来自 step 的 execute 上下文。`holder` 用的就是它，但**事件也要带** ——
+ *   否则 `repo:lock` 这条「串行保证的可见证据」归不到 run，多 run 交错时看不出谁等了谁。
  * @returns 本机 clone 路径（无 target 时 undefined）
  */
 async function lockAndDescribeTarget(
   target: RepoTarget | undefined,
   holder: string,
-  stageName: string
+  stageName: StageName,
+  runId: string | null
 ): Promise<string | undefined> {
   if (!target) return undefined;
   const localPath = repoRoot(target);
@@ -445,6 +519,7 @@ async function lockAndDescribeTarget(
   const res = await acquireRepoLock(repoKey, holder);
   stage('repo:lock', {
     stage: stageName,
+    runId,
     repoKey,
     holder,
     acquired: res.acquired,
@@ -462,7 +537,7 @@ async function lockAndDescribeTarget(
         `会让 commit 落到**错误的分支**上，且全程不报错。`
     );
   }
-  stage('repo:target', { stage: stageName, repoKey, baseBranch: target.baseBranch, localPath });
+  stage('repo:target', { stage: stageName, runId, repoKey, baseBranch: target.baseBranch, localPath });
   return localPath;
 }
 
@@ -475,14 +550,28 @@ async function lockAndDescribeTarget(
  * ⚠️ 释放**刻意 best-effort 不抛错**：释放失败不该把一个已经成功的 run 变成失败；
  * 残留锁会在 TTL 后被抢占（见 `repo-lock.ts` 文件头的取舍说明）。
  */
-async function releaseTargetLock(target: RepoTarget | undefined, holder: string): Promise<void> {
+async function releaseTargetLock(
+  target: RepoTarget | undefined,
+  holder: string,
+  runId: string | null
+): Promise<void> {
   if (!target) return;
   const repoKey = repoKeyOf(target);
   try {
     const released = await releaseRepoLock(repoKey, holder);
-    stage('repo:unlock', { repoKey, holder, released });
+    stage('repo:unlock', { stage: 'push-open-pr', runId, repoKey, holder, released });
   } catch (e) {
-    console.warn(`[repo-lock] 释放 ${repoKey} 的锁失败(将由 TTL 兜底): ${e instanceof Error ? e.message : e}`);
+    // M6-1：原先只 console.warn。锁释放失败会导致「后续 run 白等 10 分钟」，
+    // 属于必须留痕的事件（不是一句终端告警就够）。
+    stage('repo:unlock', {
+      stage: 'push-open-pr',
+      runId,
+      repoKey,
+      holder,
+      released: false,
+      error: errorText(e),
+      note: '释放失败，将由 TTL 兜底',
+    });
   }
 }
 
@@ -510,15 +599,39 @@ async function releaseTargetLock(target: RepoTarget | undefined, holder: string)
  * **每一个可能从 step 里抛出去的 catch 都必须走这里**，不要把 `p.fail(e); throw e`
  * 写回成裸的两行 —— 那样就少了一次释放。留一把锁的代价是 10 分钟白等 + 一次 AC 失败；
  * 多走一次 release 的代价是零（`releaseRepoLock` 是 holder 校验 + 幂等，非持有者释放是 no-op）。
+ *
+ * ## M6-5 追加：这里同时是 `run:end` 的收口点
+ *
+ * 失败就是「run 到此为止」，所以终态事件在这里落 —— 与放锁同一个出口。
+ * 这样「哪些路径会终止 run」与「哪些路径会写终态」**由同一段代码保证**，
+ * 不会出现「新加一条终止路径但忘了补 run:end」。
+ *
+ * `runEnd` 自身是幂等的（同一 runId 每进程只落一条），所以即使外层还有一层兜底也不会写重。
+ *
+ * ## M6-5 追加：`p.fail` 在这里是**唯一**的调用点
+ *
+ * 判负处一律 `throw new StepFailError(msg, extra)`（见该类注释），不再自己调 `p.fail`
+ * —— 否则一个 step 会落两条 `step:fail`（实测历史日志 141 start vs 146 end 的成因之一）。
  */
 async function terminateStep(
   e: unknown,
-  p: { fail: (err: unknown, extra?: Record<string, unknown>) => void } | undefined,
+  p: { stage: StageName; runId: string | null; fail: (err: unknown, extra?: Record<string, unknown>) => void } | undefined,
   target: RepoTarget | undefined,
   holder: string
 ): Promise<never> {
-  await releaseTargetLock(target, holder);
-  if (p) p.fail(e);
+  await releaseTargetLock(target, holder, p?.runId ?? null);
+  // 上下文（如 agentModifiedTests / decision / testsPassed）挂在异常上一起带过来
+  if (p) p.fail(e, e instanceof StepFailError ? e.extra : undefined);
+  if (p) {
+    runEnd({
+      stage: p.stage,
+      runId: p.runId,
+      status: 'failed',
+      failedStage: p.stage,
+      reason: errorText(e).slice(0, 300),
+      ...(target ? { repoKey: repoKeyOf(target) } : {}),
+    });
+  }
   throw e instanceof Error ? e : new Error(String(e));
 }
 
@@ -529,11 +642,21 @@ const checkout = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData, runId }) => {
-    const p = stageStart('checkout');
+    // M6-5：`run:start` 由**第一个 step** 落。为什么放在 workflow 内而不是调用方，
+    // 见 `progress.ts` 的 runStart 注释（调用方含已归档的证据产出器，不能改）。
+    runStart({
+      stage: 'checkout',
+      runId,
+      issueNumber: inputData.issueNumber,
+      issueTitle: inputData.issueTitle,
+      stopAfterCommit: Boolean(inputData.stopAfterCommit),
+      workflow: 'dev-workflow',
+    });
+    const p = stageStart({ stage: 'checkout', runId });
     try {
       // M5b-4：锁必须在**建分支之前**拿到 —— 「抢工作树」这件事本身就是临界区的开始。
       // holder 用 runId：它天然唯一，且与日志/快照可交叉引用。
-      await lockAndDescribeTarget(inputData.target, runId, 'checkout');
+      await lockAndDescribeTarget(inputData.target, runId, 'checkout', runId);
       const branch = await githubCheckout(inputData.issueNumber, inputData.issueTitle, inputData.target);
       p.done({ branch });
       return { ...inputData, branch };
@@ -542,10 +665,14 @@ const checkout = createStep({
       // 后果:分支其实没建成,后续 coding 仍在原分支(可能是 main)上改文件、commit 也落在那里,
       // 而 AC-1「当前分支 = feat/<n>-<slug>」会因占位名看起来成立 —— 典型的假绿。
       // 建分支失败没有安全的降级路径,必须显式失败。
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error(`[checkout] 建分支失败,终止流程(不降级到占位分支名): ${msg}`);
-      // M5：本步是**拿锁的那一步**，它自己抛错同样要放锁（否则一次建分支失败就泄漏一把锁）
-      return await terminateStep(e, p, inputData.target, runId);
+      // M6：失败原因由 `terminateStep` 统一落 `step:fail` + `run:end`（不再单独 console.error，
+      // 那会与结构化事件重复，且终端一关就没了）。
+      return await terminateStep(
+        new StepFailError(`建分支失败，终止流程（不降级到占位分支名）：${errorText(e)}`),
+        p,
+        inputData.target,
+        runId
+      );
     }
   },
 });
@@ -577,32 +704,31 @@ const coding = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData, runId }) => {
-    const p = stageStart('coding');
-    // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
-    const { getCodingAgent, missingCodingCredentials, getRepoRoot } = await import('../agents/coding-agent.js');
-    // M5：凭据检查也放进 `try` —— 它同样会 `throw`，而「任何从 step 抛出的错误都必须先放锁」
-    // （约定见 terminateStep 的注释）。原先它写在 `try` 之外，是一处**不会被 catch 覆盖的抛错点**。
+    const p = stageStart({ stage: 'coding', runId });
     try {
+      // 懒加载编码执行体:避免 Midway app 启动时静态拉入 @mastra/claude(其 ESM 依赖在 jest/部分运行时环境会干扰框架初始化)
+      // M6：移到 `try` 内 —— 动态 import 自身也会失败，而它是**持锁期间**的抛错点，
+      // 放在 try 外就成了一条「不会被 catch 覆盖」的路径（同 M5 修凭据检查的那个理由）。
+      const { getCodingAgent, missingCodingCredentials, getRepoRoot } = await import('../agents/coding-agent.js');
       if (missingCodingCredentials()) {
         // 用 error 而非 warn:走到这里意味着「编码这个核心能力根本没执行」,静默降级会让
         // 后续 test/review/commit 全部基于空结果跑完,表面上全绿实则什么都没做。
         // 凭据判定逻辑与历史坑见 coding-agent.ts 的 missingCodingCredentials 注释。
-        console.error(
-          '[coding] 未发现任何编码后端凭据,跳过真实编码。已检查:进程 env 的 ANTHROPIC_API_KEY/CLAUDE_API_KEY、' +
-            'CODING_ANTHROPIC_*、以及 ~/.claude/settings.json 的 env 块。' +
+        // M6：诊断信息随异常一起落进结构化日志（原先只 console.error，终端一关就没了）。
+        throw new StepFailError(
+          'SKIPPED_NO_CREDENTIALS: 未发现任何编码后端凭据,跳过真实编码,编码未执行。已检查:进程 env 的 ' +
+            'ANTHROPIC_API_KEY/CLAUDE_API_KEY、CODING_ANTHROPIC_*、以及 ~/.claude/settings.json 的 env 块。' +
             '若本机 Claude Code 可正常使用,请确认 ~/.claude/settings.json 里存在 env.ANTHROPIC_BASE_URL;' +
-            '否则显式设置 CODING_ANTHROPIC_BASE_URL / CODING_ANTHROPIC_API_KEY。'
+            '否则显式设置 CODING_ANTHROPIC_BASE_URL / CODING_ANTHROPIC_API_KEY。',
+          { reason: 'no-coding-credentials' }
         );
-        // 2026-09-07 改:原先返回占位串继续跑,于是 test/review/commit 基于「什么都没改」的空仓库
-        // 全部跑完,末尾还可能提交一个空 commit —— 表面走完全流程,实质零产出且难判别。
-        // 编码是后续一切闸门的输入,它没跑就等于这次运行没有意义,应当终止。
-        p.fail('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据');
-        throw new Error('SKIPPED_NO_CREDENTIALS: 未发现编码后端凭据,编码未执行');
       }
       // M5：一次解析、两处复用（agent 的 cwd 与红线都基于同一个 root）——
       // 各解析一次会让两者有分叉的机会（M3 parseOwnerRepo 的坑就是「两处各解析出不同仓库」）。
       const root = getRepoRoot(inputData.target);
-      const agent = await getCodingAgent(root, inputData.target);
+      // M6-2：把 runId 一路带到 PreToolUse hook，让 `guard:deny` 也归得到 run
+      // （红线生效的证据若归不到 run，多 run 交错时就无法回答「哪一次被拦了」）。
+      const agent = await getCodingAgent(root, inputData.target, runId);
       const timeoutMs = Number(process.env.CODING_TIMEOUT_MS ?? 600_000);
       const prompt =
         `你在一个 git 仓库的 feature 分支 \`${inputData.branch}\` 上。请实现以下 issue 对应的代码改动:\n\n` +
@@ -614,7 +740,7 @@ const coding = createStep({
 
       // 关键观测点(2026-09-14):编码是唯一「分钟级静默阻塞」的步骤。此处显式打出
       // 「即将调用、超时预算多少」,让使用者知道**等待是预期的**而非挂死。
-      stage('llm:start', { stage: 'coding', timeoutMs, repoRoot: root, branch: inputData.branch });
+      stage('llm:start', { stage: 'coding', runId, timeoutMs, repoRoot: root, branch: inputData.branch });
 
       // 心跳(2026-09-14):每 HEARTBEAT_MS 打一条,证明进程活着。Claude Code CLI 内部
       // 无法逐轮回调(见下方 stream 方案评估),心跳是当前唯一能区分「慢」与「死」的手段。
@@ -625,6 +751,7 @@ const coding = createStep({
         ? setInterval(() => {
             stage('llm:done', {
               stage: 'coding',
+              runId,
               heartbeat: true,
               elapsedMs: Date.now() - t0,
               note: '编码子进程仍在运行(此为心跳,非完成)',
@@ -639,15 +766,21 @@ const coding = createStep({
         if (heartbeat) clearInterval(heartbeat);
       }
 
-      stage('llm:done', { stage: 'coding', durationMs: Date.now() - t0, resultLen: String(res.text ?? '').length });
+      // M6-4：coding 走 Claude Code CLI，中继未必回传 usage —— 拿不到就记 null（不是 0）。
+      stage('llm:done', {
+        stage: 'coding',
+        runId,
+        durationMs: Date.now() - t0,
+        resultLen: String(res.text ?? '').length,
+        usage: normalizeUsage(usageOf(res)),
+      });
       p.done({ durationMs: Date.now() - t0 });
       return { ...inputData, codingResult: res.text ?? '(no output)' };
     } catch (e) {
       // 2026-09-07 改:同上 —— 编码失败后 test/review/commit 失去意义,不降级、不占位,直接终止。
       // 实测依据(2026-09-07):编码因后端 502 超时 600s 后,后续 test 步仍基于空改动继续调用
       // LLM 并因 502 失败,整个 run 变成「两次超时的叠加」,错误信息反而更难读。
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error('[coding] 执行异常,终止流程:', msg);
+      // M6：不再单独 console.error —— `terminateStep` 会落 `step:fail` + `run:end` 并镜像到终端。
       return await terminateStep(e, p, inputData.target, runId);
     }
   },
@@ -660,7 +793,7 @@ const testStep = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData, runId }) => {
-    const p = stageStart('test');
+    const p = stageStart({ stage: 'test', runId });
     try {
       // 懒加载取仓库根(与 coding 步同源),避免静态引入 @mastra/claude 干扰框架初始化
       const { getRepoRoot } = await import('../agents/coding-agent.js');
@@ -673,6 +806,8 @@ const testStep = createStep({
       const testRun = await runTests(root);
       const testsPassed = testRun.executed ? testRun.exitCode === 0 : null;
       stage('test:run', {
+        stage: 'test',
+        runId,
         executed: testRun.executed,
         runner: testRun.runner,
         // AC-1 的证据就在这里：把**可直接复跑的完整命令**落进结构化日志。
@@ -684,7 +819,6 @@ const testStep = createStep({
         testFileCount: testRun.testFileCount,
         testsPassed,
       });
-      if (testRun.command) console.log(`[test] 程序侧真实执行的命令: ${testRun.command}`);
 
       // ================= 程序路 2：自证检测（M4-5）=================
       // 「跑测试」这件事可不可信，取决于**测试是谁写的**，而不是跑没跑。
@@ -694,6 +828,8 @@ const testStep = createStep({
       );
       const agentModifiedTests = touched.modified.length > 0;
       stage('test:touch', {
+        stage: 'test',
+        runId,
         agentModifiedTests,
         modified: touched.modified,
         added: touched.added,
@@ -716,18 +852,18 @@ const testStep = createStep({
        */
       const modifyPolicy = (process.env.TEST_GUARD_MODIFY_TESTS ?? 'block').toLowerCase();
       if (agentModifiedTests && modifyPolicy !== 'warn') {
-        const msg =
+        // M6-5：只 throw，不在这里 `p.fail` —— 否则本步会落两条 `step:fail`（见 StepFailError 注释）
+        throw new StepFailError(
           `GATE_REJECTED@test: agent 修改/删除了既有测试文件 → 自证循环(自己改考卷),已阻断。` +
-          `被改动的测试文件: ${touched.modified.join(', ')}` +
-          ` | 本次程序侧测试结果: exit=${testRun.exitCode ?? 'n/a'}(${testRun.reason})` +
-          ` | 若确认属正当的规格变更,设 TEST_GUARD_MODIFY_TESTS=warn 显式降级为仅告警。`;
-        console.warn(`[test] ${msg}`);
-        p.fail(msg, { agentModifiedTests: true, modified: touched.modified });
-        throw new Error(msg);
+            `被改动的测试文件: ${touched.modified.join(', ')}` +
+            ` | 本次程序侧测试结果: exit=${testRun.exitCode ?? 'n/a'}(${testRun.reason})` +
+            ` | 若确认属正当的规格变更,设 TEST_GUARD_MODIFY_TESTS=warn 显式降级为仅告警。`,
+          { agentModifiedTests: true, modified: touched.modified }
+        );
       }
 
       // ================= 语义路：LLM 只判 requirementMet（M4-3）=================
-      stage('llm:start', { stage: 'test', diffChars: change.diffChars, truncated: change.truncated });
+      stage('llm:start', { stage: 'test', runId, diffChars: change.diffChars, truncated: change.truncated });
       const llm = await runGate(
         mastra,
         `你要判断的是:**下列改动有没有实现需求**。\n` +
@@ -746,7 +882,8 @@ const testStep = createStep({
           `2. 你只回答一个问题:**改动是否实现了【需求】**。\n` +
           `3. 需求未被实现 / 改动为空 / 明显不完整 → requirementMet=false,并在 report 里说清缺什么。\n` +
           `4. **不要为看不见的内容背书。**`,
-        LlmTestGateSchema
+        LlmTestGateSchema,
+        runId
       );
 
       // ================= 程序合成 passed（M4-3）=================
@@ -814,12 +951,12 @@ const testStep = createStep({
       if (!passed) {
         // M4:判负理由**分开列**。M2/M3 时只有一个 passed,事后无法分辨
         // 「是测试红」还是「是模型认为需求没做」—— 排障时这一条信息最贵。
-        const msg =
+        throw new StepFailError(
           `GATE_REJECTED@test: 测试闸门判负,终止流水线(不进入 review/commit/push)。` +
-          `testsPassed=${testsPassed}(exit=${testRun.exitCode ?? 'n/a'},reason=${testRun.reason})` +
-          ` | requirementMet=${llm.requirementMet} | 详情: ${llm.report.slice(0, 300)}`;
-        p.fail(msg, { testsPassed, requirementMet: llm.requirementMet });
-        throw new Error(msg);
+            `testsPassed=${testsPassed}(exit=${testRun.exitCode ?? 'n/a'},reason=${testRun.reason})` +
+            ` | requirementMet=${llm.requirementMet} | 详情: ${llm.report.slice(0, 300)}`,
+          { testsPassed, requirementMet: llm.requirementMet }
+        );
       }
       p.done({ passed: true, testsPassed, requirementMet: llm.requirementMet });
       return { ...inputData, testResult };
@@ -837,7 +974,7 @@ const review = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData, runId }) => {
-    const p = stageStart('review');
+    const p = stageStart({ stage: 'review', runId });
     try {
       // 2026-09-15 修:同 test 步 —— 原先只给 issueTitle,review 看不见改动 → 恒判 request-changes。
       // M5 修:必须把 `inputData.target` 传下去。漏传的后果**不是「取不到 diff」，而是「取到了
@@ -849,7 +986,7 @@ const review = createStep({
       // ⚠️ 这个 bug 在 M1–M4 **看不见** —— 那几轮都设了 `CODING_REPO_ROOT`，回退恰好命中正确仓库。
       // 是「去全局化」把它暴露出来的：去 env 化会把所有隐式回退变成显式错误。
       const change = buildChangeContext(undefined, inputData.target);
-      stage('llm:start', { stage: 'review', diffChars: change.diffChars, truncated: change.truncated });
+      stage('llm:start', { stage: 'review', runId, diffChars: change.diffChars, truncated: change.truncated });
       const reviewResult = await runGate(
         mastra,
         `使用 code-review skill 审核**下列改动**。\n\n` +
@@ -862,7 +999,8 @@ const review = createStep({
           `【判定依据】decision 必须基于**上面看到的真实改动**:仅当改动满足需求且无明显缺陷时 approve;` +
           `否则 request-changes,并在 comments 里逐条指出具体问题(定位到文件/行为,不要泛泛而谈)。` +
           `**不要为看不见的内容背书。**`,
-        ReviewGateSchema
+        ReviewGateSchema,
+        runId
       );
       // M3-8:审核判负 → **显式终止**(同 test 步,理由与 branch 实测结论见该步注释)。
       // 这一条比 test 那条更关键:review 通过与否决定「这次改动值不值得进远端」。
@@ -870,11 +1008,12 @@ const review = createStep({
       // 等于把「审核明确否决的改动」推到远端,而 PR 描述里还写着 decision=request-changes。
       // M2 时代价有限(只落在本地工作区),M3 起改动会被推到真实仓库,误判代价不可逆。
       if (reviewResult.decision === 'request-changes') {
-        const msg =
+        // M6-5：只 throw，不再自己 `p.fail`（否则本步落两条 step:fail，见 StepFailError 注释）
+        throw new StepFailError(
           `GATE_REJECTED@review: 审核判 request-changes,终止流水线(不进入 commit/push)。` +
-          `意见: ${reviewResult.comments.join('; ').slice(0, 300) || '(无)'}`;
-        p.fail(msg, { decision: 'request-changes' });
-        throw new Error(msg);
+            `意见: ${reviewResult.comments.join('; ').slice(0, 300) || '(无)'}`,
+          { decision: 'request-changes' }
+        );
       }
       p.done({ decision: 'approve' });
       return { ...inputData, reviewResult };
@@ -892,14 +1031,14 @@ const commit = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ mastra, inputData, runId }) => {
-    const p = stageStart('commit');
+    const p = stageStart({ stage: 'commit', runId });
     try {
       // 2026-09-15 修:改用公共 helper(不再各写一份 diff 取法),并把「输出契约」逐字写进 prompt。
       // 原实现只写「使用 commit-message skill 生成 commit message」——模型于是按 skill 声明的
       // {type, scope, subject, body} 输出,而 schema 要 {message}:两边对不上,3 次重试全挂。
       // M5 修:同 review 步 —— 必须传 target，否则生成 commit message 的依据是别的仓库的 diff。
       const change = buildChangeContext(undefined, inputData.target);
-      stage('llm:start', { stage: 'commit', diffChars: change.diffChars, truncated: change.truncated });
+      stage('llm:start', { stage: 'commit', runId, diffChars: change.diffChars, truncated: change.truncated });
 
       const commitResult = await runGate(
         mastra,
@@ -911,18 +1050,21 @@ const commit = createStep({
           `示例:{"message":"docs(readme): add install section\\n\\nAdd git clone and npm install steps.\\n\\nCloses #1"}\n\n` +
           `注意:message 用 \\n 表示换行。不要输出 type / scope / subject / body 这类拆分字段,` +
           `也不要输出 command 字段 —— 只要上面这一个 message 字符串。`,
-        CommitGateSchema
+        CommitGateSchema,
+        runId
       );
       // 真正落盘:把当前改动 commit 到 feature 分支(git add -A + commit)
       try {
         const r = gitCommit(commitResult.message, undefined, inputData.target);
-        if (!r.committed && r.error && r.error !== 'nothing-to-commit') {
-          console.warn('[commit] 未产生提交:', r.error);
-        }
-        p.done({ committed: r.committed, message: commitResult.message.slice(0, 60) });
+        // M6-1：原先这两条只 console.warn（随会话消失）。现在一并落进 step:done 的字段里
+        // —— 「有没有真的产生提交」是后续一切判断（PR 有没有内容）的前提，不能只活在终端里。
+        p.done({
+          committed: r.committed,
+          message: commitResult.message.slice(0, 60),
+          ...(r.error ? { gitError: r.error } : {}),
+        });
       } catch (e) {
-        console.warn('[commit] git commit 异常:', e instanceof Error ? e.message : e);
-        p.done({ committed: false, gitError: e instanceof Error ? e.message : String(e) });
+        p.done({ committed: false, gitError: errorText(e) });
       }
       return { ...inputData, commitResult };
     } catch (e) {
@@ -944,7 +1086,10 @@ const commit = createStep({
  * 真正的收口约定见 `terminateStep`（每个可能抛出的 catch 都要放锁），本步的 finally 只是
  * 其中一条出路。实测泄漏见该函数注释。
  */
-async function runPushOpenPr(inputData: z.infer<typeof ContextSchema>): Promise<z.infer<typeof ContextSchema>> {
+async function runPushOpenPr(
+  inputData: z.infer<typeof ContextSchema>,
+  runId: string | null
+): Promise<z.infer<typeof ContextSchema>> {
   if (inputData.stopAfterCommit) {
     // M2「零远端」:不 push、不开 PR。与「未配置 GitHub」走同一出口(prNumber=0),
     // 下游 merge 步据此判定无可合对象。
@@ -954,7 +1099,7 @@ async function runPushOpenPr(inputData: z.infer<typeof ContextSchema>): Promise<
     // 未配置 GitHub → 跳过,prNumber 保持 0,不阻断后续 notify/merge
     return { ...inputData, prNumber: 0 };
   }
-  const p = stageStart('push-open-pr');
+  const p = stageStart({ stage: 'push-open-pr', runId });
   try {
     const res = await githubPushAndOpenPR({
       branch: inputData.branch ?? `feat/${inputData.issueNumber}-dev`,
@@ -969,13 +1114,12 @@ async function runPushOpenPr(inputData: z.infer<typeof ContextSchema>): Promise<
       // 静默失败比崩溃更难排查:M2 零远端时「继续」的代价只是白跑一遍,
       // M3 真写远端后,判断依据(有没有 PR)与流程状态(等 approve)会互相矛盾。
       // M3 卡 §10 异常表:影响远端的失败必须显式阻断,不得降级为「仅告警」。
-      p.fail(res.error);
-      throw new Error(`[push-open-pr] 失败: ${res.error}`);
+      // M6-5：只 throw（带 extra），`p.fail` 由下面的 catch 唯一负责 —— 原先
+      // `p.fail` + `throw` 会被同一个 catch 再 `p.fail` 一次，一个 step 落两条 step:fail。
+      throw new StepFailError(`[push-open-pr] 失败: ${res.error}`, { prError: res.error });
     } else if (res.skipped) {
-      console.warn('[push-open-pr] 未配置 GitHub,已跳过');
-      p.done({ skipped: true });
+      p.done({ skipped: true, note: '未配置 GitHub，已跳过' });
     } else if (res.prUrl) {
-      console.log('[push-open-pr] PR 已开:', res.prUrl);
       p.done({ prNumber: res.prNumber, prUrl: res.prUrl });
     } else {
       p.done({});
@@ -985,7 +1129,7 @@ async function runPushOpenPr(inputData: z.infer<typeof ContextSchema>): Promise<
     // 的 prUrl 是 `z.string().optional()`(不接受 null)。直接透传会让 zod 校验失败。
     return { ...inputData, prNumber: res.prNumber, prUrl: res.prUrl ?? undefined };
   } catch (e) {
-    p.fail(e);
+    p.fail(e, e instanceof StepFailError ? e.extra : undefined);
     throw e;
   }
 }
@@ -997,12 +1141,32 @@ const pushOpenPr = createStep({
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
   execute: async ({ inputData, runId }) => {
+    // M6-5：本步不走 `terminateStep`（它自己管锁），却又是**能终止 run 的一步**
+    // （push 失败按 M3-3 是显式阻断）。所以这里得自己落 `run:end`。
+    //
+    // 顺序刻意是「先放锁、再落终态」：`run:end` 应当是某个 run 的**最后一条业务事件**，
+    // 若排在 `repo:unlock` 之前，读日志时会先看到 run 结束、再看到锁才放开（自相矛盾）。
+    // 做法：catch 只记录错误，落终态的活儿交给 finally —— JS 保证 catch 先于 finally 执行。
+    let failure: unknown;
     try {
-      return await runPushOpenPr(inputData);
+      return await runPushOpenPr(inputData, runId);
+    } catch (e) {
+      failure = e;
+      throw e;
     } finally {
       // M5b-4：本步是临界区的**最后一步**（checkout → coding → test → review → commit → push），
       // 因此锁在这里释放。用 finally 保证「四条出路都释放」，包括抛错那条。
-      await releaseTargetLock(inputData.target, runId);
+      await releaseTargetLock(inputData.target, runId, runId);
+      if (failure !== undefined) {
+        runEnd({
+          stage: 'push-open-pr',
+          runId,
+          status: 'failed',
+          failedStage: 'push-open-pr',
+          reason: errorText(failure).slice(0, 300),
+          ...(inputData.target ? { repoKey: repoKeyOf(inputData.target) } : {}),
+        });
+      }
     }
   },
 });
@@ -1013,8 +1177,8 @@ const notify = createStep({
   description: '飞书推开发完成卡片,等用户确认合并',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ inputData }) => {
-    // 接入飞书 adapter:推开发完成卡片(合并/拒绝按钮,callback_id 内嵌 issue 号)。
+  execute: async ({ inputData, runId }) => {
+    // 接入飞书 adapter:推开发完成卡片(合并/拒绝按钮,按钮 value 内嵌 runId)。
     // 未配置飞书 → 跳过通知,不阻断流程(后续 merge 步仍会 suspend 等人确认)。
     // 配置但推送失败 → 仅告警,不阻断(按钮回调 resume 属后续 IM 入口工作)。
     if (inputData.stopAfterCommit) {
@@ -1025,7 +1189,7 @@ const notify = createStep({
     if (!getFeishuConfig()) {
       return inputData;
     }
-    const p = stageStart('notify');
+    const p = stageStart({ stage: 'notify', runId });
     try {
       const res = await feishuNotify(
         buildDevCompleteCard({
@@ -1037,13 +1201,17 @@ const notify = createStep({
         })
       );
       if (!res.ok) {
-        console.warn(`[notify] 飞书推送失败(mode=${res.mode}):`, res.error || JSON.stringify(res.raw));
-        p.fail(`飞书推送失败(mode=${res.mode})`);
+        // M6-1：原先只 console.warn —— 「卡片到底发出去没有」是 M7 按钮回调的前置事实，
+        // 必须落文件（否则点不动按钮时无从判断是「卡片没发」还是「回调没接」）。
+        p.fail(`飞书推送失败(mode=${res.mode})`, {
+          mode: res.mode,
+          feishuError: res.error ?? null,
+          raw: res.raw ? JSON.stringify(res.raw).slice(0, 300) : null,
+        });
       } else {
         p.done({ mode: res.mode });
       }
     } catch (e) {
-      console.warn('[notify] 飞书推送异常:', e instanceof Error ? e.message : e);
       p.fail(e);
     }
     return inputData;
@@ -1072,34 +1240,56 @@ const notify = createStep({
  *
  * 「拒绝」是**合法的人工决策**,不是流水线故障。把它记成失败会污染
  * 「哪些 run 真的坏了」这一判断;正确做法是正常结束 + `mergeResult` 写明结局。
+ * （M6 起这条语义落在 `run:end.status = 'rejected'` —— 它既不是 `ok` 也不是 `failed`,
+ * 与 Mastra 自己的 run status 解耦：Mastra 认为「没抛错就是成功」,而我们要的是**业务终态**。）
+ *
+ * ## M6-5：本步是 `run:end` 的**最后一个出口**
+ *
+ * 八步里其余各步失败都经 `terminateStep` 收口,而 merge 是**终点**：
+ * 正常结束、拒绝、无 PR 可合、合并失败 —— 四条出路都要落终态,且**只有一条**
+ * （`runEnd` 内部按 runId 幂等）。凡是将来新增分支,都要在这里补一个出口。
  */
 const merge = createStep({
   id: 'merge',
   description: '用户确认后经 GitHub REST API 对 PR 执行 squash merge',
   inputSchema: ContextSchema,
   outputSchema: ContextSchema,
-  execute: async ({ inputData, suspend, resumeData }) => {
+  execute: async ({ inputData, suspend, resumeData, runId }) => {
+    /** 本 run 的目标仓库字段（有 target 才写 —— 单仓库模式不猜、不填占位）。 */
+    const repoFields = inputData.target ? { repoKey: repoKeyOf(inputData.target) } : {};
+
     // M2:不进人工合并关卡。必须在 suspend 之前判断,否则 workflow 会停在这里等人 approve,
     // 而 M2 根本没有可合的 PR —— 那是一个永远不会被点掉的挂起。
     if (inputData.stopAfterCommit) {
-      return { ...inputData, mergeResult: '(skipped: stopAfterCommit,M2 不执行合并关卡)' };
+      const mergeResult = '(skipped: stopAfterCommit,M2 不执行合并关卡)';
+      runEnd({ stage: 'merge', runId, status: 'skipped', reason: mergeResult, ...repoFields });
+      return { ...inputData, mergeResult };
     }
     const decision = (resumeData ?? {}) as { approved?: boolean };
 
     // ① 明确拒绝 → 终止(不合并,也不再挂起,理由见上方注释块)
     if (resumeData && decision.approved === false) {
-      const p = stageStart('merge', 'rejected');
+      const p = stageStart({ stage: 'merge', runId });
       const mergeResult = 'merge-skipped: 用户明确拒绝,PR 保持 open(未合并,可由人工处置)';
-      console.log(`[merge] ${mergeResult}`);
       // 刻意不关 PR:关闭是另一个不可逆动作,且「拒绝合并」与「废弃这个 PR」
       // 不是同一件事 —— 留 open 让人自己决定关还是改。
-      p.done({ merged: false, reason: 'user-rejected' });
+      p.done({ merged: false, reason: 'user-rejected', mergeResult });
+      runEnd({ stage: 'merge', runId, status: 'rejected', reason: mergeResult, ...repoFields });
       return { ...inputData, mergeResult };
     }
 
     // ② 尚未表态(首次进入 / resume 未带 approved)→ 挂起等人确认
     if (decision.approved !== true) {
-      stage('step:start', { stage: 'merge', waitingFor: 'merge-approval' });
+      // M6-5：这里**不再是** `stage('step:start', ...)`。
+      // 挂起不是「某一步开始了」，它是 run 停下来等人 —— 借 step:start 表达会凭空
+      // 造出一个没有配对的 start，直接污染 AC-4 的配对判据（历史日志里就是这样）。
+      runSuspend({
+        stage: 'merge',
+        runId,
+        waitingFor: 'merge-approval',
+        issueNumber: inputData.issueNumber,
+        ...repoFields,
+      });
       return suspend({
         waitingFor: 'merge-approval',
         issueNumber: inputData.issueNumber,
@@ -1107,12 +1297,12 @@ const merge = createStep({
     }
 
     // ③ 批准 → 真合并
-    const p = stageStart('merge', 'resumed');
+    const p = stageStart({ stage: 'merge', runId });
     // 已确认:真实合并。没开出 PR(prNumber=0)就没东西可合,标记失败供上层判读。
     if (!inputData.prNumber || inputData.prNumber <= 0) {
       const mergeResult = `merge-skipped: 无已开 PR(prNumber=${inputData.prNumber ?? 0}),无法合并`;
-      console.warn(`[merge] ${mergeResult}`);
-      p.done({ merged: false, reason: 'no-pr' });
+      p.done({ merged: false, reason: 'no-pr', mergeResult });
+      runEnd({ stage: 'merge', runId, status: 'skipped', reason: mergeResult, ...repoFields });
       return { ...inputData, mergeResult };
     }
     try {
@@ -1121,18 +1311,33 @@ const merge = createStep({
         ? `merge-ok: PR #${inputData.prNumber} 已 squash 合入(sha=${res.sha})`
         : `merge-fail: ${res.message ?? '未知原因'}`;
       if (!res.merged) {
-        console.warn(`[merge] ${mergeResult}`);
         p.fail(mergeResult);
+        runEnd({
+          stage: 'merge',
+          runId,
+          status: 'failed',
+          failedStage: 'merge',
+          reason: mergeResult,
+          prNumber: inputData.prNumber,
+          ...repoFields,
+        });
       } else {
-        console.log(`[merge] ${mergeResult}`);
-        p.done({ merged: true, sha: res.sha });
+        p.done({ merged: true, sha: res.sha, mergeResult });
+        runEnd({
+          stage: 'merge',
+          runId,
+          status: 'ok',
+          reason: mergeResult,
+          prNumber: inputData.prNumber,
+          ...repoFields,
+        });
       }
       return { ...inputData, mergeResult };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const mergeResult = `merge-error: ${msg}`;
-      console.error(`[merge] ${mergeResult}`);
       p.fail(e);
+      runEnd({ stage: 'merge', runId, status: 'failed', failedStage: 'merge', reason: mergeResult, ...repoFields });
       return { ...inputData, mergeResult };
     }
   },

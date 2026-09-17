@@ -15,13 +15,19 @@
 module.exports = {
   preset: 'ts-jest',
   testEnvironment: 'node',
+  /**
+   * 每个测试文件运行前执行一次（M6-1 新增）。
+   * 作用：把结构化日志的落盘路径从生产日志 `logs/dev-workflow.log` 挪到临时目录
+   * —— 否则单测会往作为「证据」的日志里混事件，污染 AC-3 的判据。原因详见该文件注释。
+   */
+  setupFiles: ['<rootDir>/test/jest.setup.ts'],
   // 源码里相对 import 因 tsconfig module:NodeNext 必须带 .js 后缀(如 from './guard.js')。
   // jest/ts-jest 不会自动把 .js 回退解析到 .ts,故用 moduleNameMapper 把相对 .js 引用映射回 .ts。
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
   },
   // .tmp/verify/ 是一次性验证脚本(见 .gitignore),不是测试,不能被 jest 收集。
-  testPathIgnorePatterns: ['<rootDir>/test/fixtures', '<rootDir>/.tmp/'],
+  testPathIgnorePatterns: ['<rootDir>/test/fixtures', '<rootDir>/test/jest.setup.ts', '<rootDir>/.tmp/'],
   coveragePathIgnorePatterns: ['<rootDir>/test/', '<rootDir>/.tmp/'],
   // 让 @mastra/core 及其 ESM-only 依赖不被 transformIgnorePatterns 忽略,
   // 从而能进入下方 babel-jest 的转译范围。

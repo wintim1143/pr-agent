@@ -36,7 +36,7 @@
  * 「A 崩溃后 TTL 过期、B 抢到锁、此时 A 的收尾代码执行到释放」——若无脑按 `repo_key` 删除，
  * A 会**误删 B 的锁**，串行保证当场失效。故释放语句必须带 `AND holder = ?`。
  */
-import { ensureStateSchema, getStateDb } from './state-db.js';
+import { ensureStateSchema, getStateDb, isBusyError, parseEnvNumber } from './state-db.js';
 
 export interface LockInfo {
   repoKey: string;
@@ -60,22 +60,21 @@ export interface LockConfig {
   pollMs: number;
 }
 
-function num(v: string | undefined, dflt: number): number {
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : dflt;
-}
-
 /**
  * 锁参数（可由 env 覆盖，便于验证脚本用秒级超时快速判负）。
  * - `REPO_LOCK_WAIT_MS` 默认 600000（10 分钟）：等待上限
  * - `REPO_LOCK_TTL_MS`  默认 1800000（30 分钟）：必须 > 编码步超时预算
  * - `REPO_LOCK_POLL_MS` 默认 1000
+ *
+ * ⚠️ 解析走 `state-db.ts` 的 `parseEnvNumber`（**共享实现，不要在本文件另抄一份**）：
+ * 该函数把「空字符串」当未设置 —— 否则 `.env` 里留空的 `REPO_LOCK_WAIT_MS=`
+ * 会因 `Number('') === 0` 静默变成「等待上限 0ms」，即**锁永远抢不到、每次都判 lock-timeout**。
  */
 export function repoLockConfig(): LockConfig {
   return {
-    waitMs: num(process.env.REPO_LOCK_WAIT_MS, 600_000),
-    ttlMs: num(process.env.REPO_LOCK_TTL_MS, 1_800_000),
-    pollMs: num(process.env.REPO_LOCK_POLL_MS, 1_000),
+    waitMs: parseEnvNumber(process.env.REPO_LOCK_WAIT_MS, 600_000),
+    ttlMs: parseEnvNumber(process.env.REPO_LOCK_TTL_MS, 1_800_000),
+    pollMs: parseEnvNumber(process.env.REPO_LOCK_POLL_MS, 1_000),
   };
 }
 
@@ -132,42 +131,66 @@ export async function acquireRepoLock(
   for (;;) {
     const now = Date.now();
 
-    // 1) 空位 → 直接认领（唯一主键保证并发下只有一个人拿到）
-    const ins = await db.execute({
-      sql: `INSERT OR IGNORE INTO pr_agent_repo_locks (repo_key, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)`,
-      args: [repoKey, holder, now, now + cfg.ttlMs],
-    });
-    if (ins.rowsAffected === 1) {
-      return { acquired: true, waitedMs: now - started, holder: await readLock(repoKey) };
-    }
-
-    // 2) 已有人持有 → 区分三种情况
-    const cur = await readLock(repoKey);
-    if (cur) {
-      if (cur.holder === holder) {
-        // 2a) 自己已经持有 → 续期后直接返回（可重入，避免自己等自己）
-        await db.execute({
-          sql: `UPDATE pr_agent_repo_locks SET expires_at = ? WHERE repo_key = ? AND holder = ?`,
-          args: [now + cfg.ttlMs, repoKey, holder],
-        });
+    // ⚠️ 整个循环体被「写竞争兜底」包住，理由见下方 `catch`。
+    // 关键点：本函数是**轮询语义** —— `SQLITE_BUSY` 在这里等价于「这一轮没抢到」，不是故障。
+    try {
+      // 1) 空位 → 直接认领（唯一主键保证并发下只有一个人拿到）
+      const ins = await db.execute({
+        sql: `INSERT OR IGNORE INTO pr_agent_repo_locks (repo_key, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)`,
+        args: [repoKey, holder, now, now + cfg.ttlMs],
+      });
+      if (ins.rowsAffected === 1) {
         return { acquired: true, waitedMs: now - started, holder: await readLock(repoKey) };
       }
-      if (cur.expiresAt <= now) {
-        // 2b) 持有者已超 TTL（多半崩了）→ 抢占
-        const steal = await db.execute({
-          sql: `UPDATE pr_agent_repo_locks SET holder = ?, acquired_at = ?, expires_at = ? WHERE repo_key = ? AND expires_at <= ?`,
-          args: [holder, now, now + cfg.ttlMs, repoKey, now],
-        });
-        if (steal.rowsAffected === 1) {
+
+      // 2) 已有人持有 → 区分三种情况
+      const cur = await readLock(repoKey);
+      if (cur) {
+        if (cur.holder === holder) {
+          // 2a) 自己已经持有 → 续期后直接返回（可重入，避免自己等自己）
+          await db.execute({
+            sql: `UPDATE pr_agent_repo_locks SET expires_at = ? WHERE repo_key = ? AND holder = ?`,
+            args: [now + cfg.ttlMs, repoKey, holder],
+          });
           return { acquired: true, waitedMs: now - started, holder: await readLock(repoKey) };
         }
-        // 抢占失败 = 别人同时抢到了 → 落到下面继续等
+        if (cur.expiresAt <= now) {
+          // 2b) 持有者已超 TTL（多半崩了）→ 抢占
+          const steal = await db.execute({
+            sql: `UPDATE pr_agent_repo_locks SET holder = ?, acquired_at = ?, expires_at = ? WHERE repo_key = ? AND expires_at <= ?`,
+            args: [holder, now, now + cfg.ttlMs, repoKey, now],
+          });
+          if (steal.rowsAffected === 1) {
+            return { acquired: true, waitedMs: now - started, holder: await readLock(repoKey) };
+          }
+          // 抢占失败 = 别人同时抢到了 → 落到下面继续等
+        }
       }
+    } catch (e) {
+      // ⚠️ **写竞争不等于失败**：`SQLITE_BUSY` 的语义是「此刻写锁被别人拿着」，
+      // 而本函数本来就是轮询等待 —— 于是它应当与「2) 已有人持有」走**同一条出路**：继续等。
+      //
+      // 【为什么这层兜底不可省 —— 2026-09-17 实测】
+      // `PRAGMA busy_timeout`（见 `state-db.ts`）只覆盖「写锁能在超时窗口内释放」的情形。
+      // 一旦有别的连接持有**长写事务**，`SQLITE_BUSY` 仍会抛出。
+      // 而**抛出 = 崩溃**：这是一个裸的 `LibsqlError`，`repo-lock` 的调用链上没有捕获它的人
+      // —— 实测表现就是「**子进程整个崩掉、一条记录都不写**」，
+      // 上层看到的现象是「第二个 run 的事件整段消失」，与根因隔了三层（见 M6 卡 §11）。
+      // 结论：**锁的竞争必须由本函数吸收，不能冒泡** —— 它连「失败」都不算，只是「还没轮到」。
+      if (!isBusyError(e)) throw e;
     }
 
     // 3) 等待（有上限）
     if (now >= deadline) {
-      return { acquired: false, waitedMs: now - started, error: 'lock-timeout', holder: await readLock(repoKey) };
+      // ⚠️ 此处 `readLock` 只用于填「占用者是谁」这一**排障字段**，拿不到不该让整个调用失败
+      // —— 判负的结论（`lock-timeout`）与它无关。
+      let occupied: LockInfo | null = null;
+      try {
+        occupied = await readLock(repoKey);
+      } catch {
+        /* 排障信息缺失不影响判负，刻意吞掉 */
+      }
+      return { acquired: false, waitedMs: now - started, error: 'lock-timeout', holder: occupied };
     }
     await sleep(Math.max(1, Math.min(cfg.pollMs, deadline - now)));
   }
