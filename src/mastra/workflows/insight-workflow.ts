@@ -231,9 +231,9 @@ const notify = createStep({
         title: '📊 仓库洞察',
         markdown: md.join('\n'),
         buttons: [
-          // ⚠️ M7 待改：这里仍是拼接标识 `confirm_<runId>`。
+          // ⚠️ M8 待改：这里仍是拼接标识 `confirm_<runId>`。
           // 已拍板改为**结构化 value**（`{kind:'insight', action:'confirm'|'rerun', runId}`），
-          // 见 `milestones/M7-飞书双向控制.md` §0.1 第 3 条 与 §7 M7-4 —— M6 范围不含卡片。
+          // 见 `milestones/M8-飞书双向控制.md` §0.2 与 §7 M8-3 —— M6/M7 范围均不含卡片回调。
           { text: '✅ 确认', value: `confirm_${runId}`, type: 'primary' },
           { text: '🔄 重跑', value: `rerun_${runId}`, type: 'default' },
         ],

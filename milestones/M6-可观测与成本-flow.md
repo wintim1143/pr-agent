@@ -149,7 +149,7 @@ flowchart TB
 
 ---
 
-## 4 与 M7 的接口（本里程碑最重要的下游）
+## 4 与 M8 的接口（本里程碑最重要的下游）
 
 ```mermaid
 sequenceDiagram
@@ -160,16 +160,18 @@ sequenceDiagram
 
     Note over WF,LG: 【M6 之后】run 从第一个 step 起就带可信 runId
     WF->>LG: step:start / llm:* / step:done ...（全部带 runId）
-    WF->>FS: 卡片按钮 value = merge_&lt;runId&gt;
+    WF->>FS: 卡片按钮 value = &#123;kind:'dev', action:'merge', runId, repoKey&#125;
     U->>FS: 点「🔀 合并」
     FS->>WF: card.action.trigger 回调，带 runId
-    Note over WF: 【M7 依赖 M6】凭 runId 找到挂起的 run → resume
+    Note over WF: 【M8 依赖 M6】凭 runId 找到挂起的 run → resume
     WF->>LG: merge step:start（同一个 runId，时间线连续）
     Note over U,LG: 人可立刻用 runId 查这个 run 走到哪一步
 ```
 
-> 📌 **这就是「M6 先于 M7」的第一性依据**：
+> 📌 **这就是「M6 先于 M8」的第一性依据**（⚠️ 2026-09-17 更正：原写作「M6 先于 M7」；
+> **M7 只做对话，不依赖 M6**）：
 > 按钮回调的本质是「**用一个标识定位某个挂起的 run 并 resume**」。
 > 现状里 dev 卡片的 value 是 `merge_<issueNumber>`（`adapters/feishu.ts:169-170`）——
 > 在多仓库 + 重跑场景下**不唯一**（同一 issue 可多次 run、A/B 两个靶场可有同号 issue）。
-> 没有可靠的 runId 贯穿，M7 的按钮就是**猜**。
+> 没有可靠的 runId 贯穿，M8 的按钮就是**猜**。
+> （另：已拍板该 value 从拼接字符串改为**结构化 JSON 对象**，见 `M8-飞书双向控制.md` §7 M8-3。）

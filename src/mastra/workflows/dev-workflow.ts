@@ -1201,7 +1201,7 @@ const notify = createStep({
         })
       );
       if (!res.ok) {
-        // M6-1：原先只 console.warn —— 「卡片到底发出去没有」是 M7 按钮回调的前置事实，
+        // M6-1：原先只 console.warn —— 「卡片到底发出去没有」是 M8 按钮回调的前置事实，
         // 必须落文件（否则点不动按钮时无从判断是「卡片没发」还是「回调没接」）。
         p.fail(`飞书推送失败(mode=${res.mode})`, {
           mode: res.mode,
